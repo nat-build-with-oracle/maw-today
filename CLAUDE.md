@@ -39,10 +39,12 @@ ln -sfn ψ psi                                        # self-contained — the s
 ln -sfn /opt/Code/github.com/laris-co/nexus-oracle/ψ psi   # a different host
 ```
 
-**While embedded, the caretaker files its days into the host's memory** (Nat's call,
-2026-09-01): the digests land in `neo-oracle/ψ/memory/days/`, where the host oracle and
-its skills already look. The lab's own `ψ/` stays as an empty skeleton — it is the
-spinoff container, not the working vault.
+**Days live in the DAY REPO, not any host vault** (Nat's call, 2026-09-01, superseding
+the earlier parent-vault destination the same afternoon): each day is its own PRIVATE
+repo — `nat-build-with-oracle/<slug>` with the /awaken vault shape — and its digest
+lives at `ψ/memory/days/<slug>.md` *inside the day it describes*. `writeDigest` resolves
+that path via `ghq root`; the psi link no longer carries digests and remains only as the
+general whose-vault mechanism. The lab's own `ψ/` stays an empty skeleton.
 
 **TRAP, paid for twice: `maw plugin install` dereferences symlinks.**
 
@@ -75,8 +77,7 @@ ln -sn /opt/Code/github.com/laris-co/neo-oracle/ψ ~/.maw/plugins/today/psi
 The lab is already repo-shaped. To spin off:
 
 1. `ln -sfn ψ psi` — flip the link to self-contained (embedded default points at the
-   parent), and decide whether the accumulated days in the host's `ψ/memory/days/`
-   move with it or stay as the host's history
+   parent). Days are unaffected: they live in their own day repos, not in any host
 2. `git init` here, or `ghq create <org>/today-oracle` and move the tree
 3. `maw plugin install <this dir>` from wherever it lands — install from a **local
    directory**, never the GitHub shorthand: the shorthand installer fetches only the
@@ -101,7 +102,9 @@ to its own entry file.
 ## Vault layout
 
 ```
-ψ/memory/days/YYYY-MM-DD.md    what happened, written by `w` in the TUI
-ψ/memory/learnings/            patterns this oracle discovers about the days
-ψ/inbox/                       handoffs in
+(this lab's ψ/ is an empty skeleton — the spinoff container)
+
+Each DAY REPO (nat-build-with-oracle/<slug>) carries the real vault:
+ψ/memory/days/<slug>.md        the digest — 1sep-tue.md style
+ψ/memory/retrospectives/ …     the rest of the /awaken shape, for what the day leaves
 ```

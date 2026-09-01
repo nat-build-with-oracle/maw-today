@@ -221,10 +221,18 @@ const fmtBytes = (n: number) => n < 1024 ? `${n}B` : n < 1048576 ? `${(n / 1024)
  * the drift-between-twins failure is this fleet's most repeated bug.
  * The report states its window (label): a day written from a partial window says so.
  */
+/** The day's own vault: ghq/github.com/<org>/<slug>/ψ. The DAY REPO is the vault
+ *  (Nat, 2026-09-01, superseding the psi-link destination): every digest lives with
+ *  the day it describes, not in any host oracle's memory. */
+export function dayVaultDir(): string {
+  const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
+  const ghqRoot = execFileSync("ghq", ["root"], { encoding: "utf8" }).trim();
+  const org = process.env.MAW_TODAY_ORG || "nat-build-with-oracle";
+  return join(ghqRoot, "github.com", org, daySlug(), "ψ");
+}
+
 export function writeDigest(commits: Commit[], sessions: Session[], label: string, vaultDir?: string): string {
-  const root = dirname(dirname(realpathSync(fileURLToPath(import.meta.url))));
-  const psi = vaultDir ?? join(root, "psi");
-  if (!existsSync(psi)) throw new Error(vaultDir ? `no vault at ${psi}` : "no psi link beside the plugin — see CLAUDE.md");
+  const psi = vaultDir ?? dayVaultDir();
   // Day slug: "1-sep-tue-2026" — deliberately NOT ISO: these are for a human flipping
   // through a folder; the ls-sorting trade is accepted. Shared builder — see daySlug().
   const day = daySlug();
