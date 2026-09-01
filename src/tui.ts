@@ -241,8 +241,9 @@ function stepWindow(dir: 1 | -1) {
 // gh failure passes null so the digest SAYS unreachable instead of faking a zero.
 async function writeDigestNote(): Promise<string> {
   try {
-    const gh = await ghToday(resolveSince(S.sinceSpec).at).catch(() => null);
-    return `digest → ${writeDigest(S.commits, S.sessions, S.label, undefined, gh)}`;
+    const since = resolveSince(S.sinceSpec);
+    const gh = await ghToday(since.at).catch(() => null);
+    return `digest → ${writeDigest(S.commits, S.sessions, S.label, undefined, gh, since.at)}`;
   } catch (e) { return String((e as Error).message); }
 }
 

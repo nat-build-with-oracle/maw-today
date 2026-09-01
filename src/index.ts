@@ -180,7 +180,9 @@ export async function gitToday(
 
 // ---- sessions ---------------------------------------------------------------
 
-export type Session = { project: string; id: string; at: number; bytes: number; file: string };
+/** typedAt: last HUMAN keyboard input in the session (ms), 0 = none found, undefined =
+ *  split unavailable (no ripgrep) — three honesty levels, same doctrine as gh. */
+export type Session = { project: string; id: string; at: number; bytes: number; file: string; typedAt?: number };
 
 /**
  * Claude Code writes one JSONL per session under ~/.claude/projects/<encoded-cwd>/.
@@ -212,7 +214,43 @@ export async function sessionsToday(since: number): Promise<Session[]> {
       } catch { /* vanished mid-scan; not fatal */ }
     }
   }
-  return out.sort((a, b) => a.at - b.at);
+  out.sort((a, b) => a.at - b.at);
+
+  // THE TYPED SPLIT — mtime is a liar's metric. Fleet listener bots and background
+  // agents append tool results and heartbeats all day, so "18 sessions" reads as 18
+  // working threads when the human drove 5 (Nat, 2026-09-01: "i just working with some
+  // less than this list" — the same trap Odin's flights caught as idle-listener ghosts
+  // and the +3600s batch-touch). "userType":"external" marks real keyboard input in
+  // Claude Code jsonl; rg the WHOLE file, because a tail window misses a morning prompt
+  // buried under an afternoon of appended tool results (this session's own jsonl grew
+  // ~5MB/hour with zero typing). One rg spawn per candidate (~18/day), 8 at a time.
+  try { await run("rg", ["--version"]); } catch { return out; }  // no ripgrep → no split; a flat list beats a misclassified one
+  const CH = 8;
+  for (let i = 0; i < out.length; i += CH) {
+    await Promise.all(out.slice(i, i + CH).map(async (s) => {
+      try {
+        const q = s.file.replace(/'/g, `'\\''`);
+        // "userType":"external" alone OVER-matches — hook summaries stamped
+        // "type":"system", tool-result arrays, empty echo artifacts, skill/command
+        // wrappers and task notifications ALL carry it (verified live: kvmbox's
+        // 03:16 "typed" was an array-content relay, and the next survivor was a
+        // stop_hook_summary). A real keyboard prompt is "type":"user" + external +
+        // non-empty STRING content + no wrapper tag — the same false-positive
+        // family Odin's sleipnir already paid for.
+        const { stdout } = await run("sh",
+          ["-c",
+           `rg -NF --no-config '"type":"user"' '${q}' | ` +
+           `rg -F '"userType":"external"' | ` +
+           `rg -v '"content":(\\[|"")' | ` +
+           `rg -vF -e '<command-message>' -e '<local-command' -e '<task-notification' -e '<system-reminder' | ` +
+           `tail -1`],
+          { maxBuffer: 4 << 20 });
+        const line = stdout.trim();
+        s.typedAt = line ? (Date.parse(JSON.parse(line).timestamp ?? "") || 0) : 0;
+      } catch { s.typedAt = 0; }   // rg exits 1 on zero matches → genuinely never typed
+    }));
+  }
+  return out;
 }
 
 // ---- github: the upstream half ----------------------------------------------
@@ -331,7 +369,7 @@ const fmtGap = (ms: number) => {
  *  makes counts floors) · null = tried and unreachable · undefined = this caller does
  *  not gather github. The digest SAYS which — a missing half must never read as a
  *  quiet day. */
-export function writeDigest(commits: Commit[], sessions: Session[], label: string, vaultDir?: string, gh?: GhDay | null): string {
+export function writeDigest(commits: Commit[], sessions: Session[], label: string, vaultDir?: string, gh?: GhDay | null, sinceAt?: number): string {
   const psi = vaultDir ?? dayVaultDir();
   // Day slug: "1-sep-tue-2026" — deliberately NOT ISO: these are for a human flipping
   // through a folder; the ls-sorting trade is accepted. Shared builder — see daySlug().
@@ -415,8 +453,24 @@ export function writeDigest(commits: Commit[], sessions: Session[], label: strin
   L.push("", `## Sessions`, "");
   // The id is a LINK to the session's jsonl (file:// — clickable in VS Code/Obsidian;
   // inert on github.com, accepted: the digest is read locally, the repo is just its home).
-  for (const s of sessions)
-    L.push(`- ${hhmmLocal(s.at)} [\`${s.id}\`](file://${encodeURI(s.file)}) ${lastTwo(s.project)} (${fmtBytes(s.bytes)})`);
+  // Typed sessions (real keyboard input) lead with 👤; background files that merely
+  // moved (listeners, agents, heartbeats) follow under their own label — see Session.typedAt.
+  const sesLine = (s: Session, mark: string) =>
+    `- ${mark}${hhmmLocal(s.at)} [\`${s.id}\`](file://${encodeURI(s.file)}) ${lastTwo(s.project)} (${fmtBytes(s.bytes)})`;
+  const canSplit = sessions.every((s) => s.typedAt !== undefined);
+  if (canSplit) {
+    // The REAL window start, from the caller — guessing it from min(mtime) misfiles a
+    // morning prompt whose file was last touched in the afternoon. Fallback = the
+    // default window, local midnight.
+    const winStart = sinceAt ?? new Date().setHours(0, 0, 0, 0);
+    const typed = sessions.filter((s) => (s.typedAt ?? 0) >= winStart);
+    const bgs = sessions.filter((s) => (s.typedAt ?? 0) < winStart);
+    for (const s of typed) L.push(sesLine(s, "👤 "));
+    if (bgs.length) {
+      L.push("", `background — file moved, no typed input this window:`, "");
+      for (const s of bgs) L.push(sesLine(s, ""));
+    }
+  } else for (const s of sessions) L.push(sesLine(s, ""));
   L.push("", `_written by maw today digest, ${new Date().toISOString()}_`, "");
   writeFileSync(f, L.join("\n"));
   return f;
@@ -555,7 +609,7 @@ async function syncDayRepo(
     gitToday(winAt), sessionsToday(winAt),
     ghToday(winAt).catch(() => null),   // null = unreachable; digest says so
   ]);
-  const f = writeDigest(commits, sessions, resolveSince(sinceSpec).label, vault, gh);
+  const f = writeDigest(commits, sessions, resolveSince(sinceSpec).label, vault, gh, winAt);
   const ghNote = gh
     ? (() => { const n = ghCounts(gh.items); return ` · ${n.opened}⇧ ${n.merged}✓ ${n.closed}⊘${gh.truncated ? " (floors)" : ""}`; })()
     : ` · gh unreachable`;
@@ -629,7 +683,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
       gitToday(winAt), sessionsToday(winAt), ghToday(winAt).catch(() => null),
     ]);
     try {
-      const f = writeDigest(commits, sessions, resolveSince(flag("since")).label, undefined, gh);
+      const f = writeDigest(commits, sessions, resolveSince(flag("since")).label, undefined, gh, winAt);
       return { ok: true, output: `${commits.length} commits · ${sessions.length} sessions\ndigest → ${f}` };
     } catch (e) { return { ok: false, error: String((e as Error).message) }; }
   }
@@ -685,8 +739,17 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
     if (!sessions.length) await emit("sessions  none");
     else {
       const projects = new Set(sessions.map((s) => s.project)).size;
-      await emit(`sessions  ${sessions.length} across ${projects} project${projects === 1 ? "" : "s"}`);
-      for (const s of sessions) await emit(`  ${hhmm(s.at)}  ${s.id}  ${short(s.project).padEnd(28)} ${bytes(s.bytes)}`);
+      const split = sessions.every((s) => s.typedAt !== undefined);
+      const typed = split ? sessions.filter((s) => (s.typedAt ?? 0) >= since.at) : sessions;
+      const bg = split ? sessions.filter((s) => (s.typedAt ?? 0) < since.at) : [];
+      await emit(`sessions  ${sessions.length} across ${projects} project${projects === 1 ? "" : "s"}` +
+        (split ? ` — ${typed.length} typed 👤 · ${bg.length} background` : ""));
+      for (const s of typed)
+        await emit(`  ${hhmm(s.at)}  ${s.id}  ${short(s.project).padEnd(28)} ${bytes(s.bytes)}${split ? `  👤 ${hhmm(s.typedAt!)}` : ""}`);
+      if (bg.length) {
+        await emit(`  background — file moved, no typed input this window (listeners, agents, heartbeats):`);
+        for (const s of bg) await emit(`    ${hhmm(s.at)}  ${s.id}  ${short(s.project).padEnd(26)} ${bytes(s.bytes)}`);
+      }
     }
     if (!wantCommits) await emit(`\ncommits: maw today commits · both: maw today all · live: maw today tui`);
   }
