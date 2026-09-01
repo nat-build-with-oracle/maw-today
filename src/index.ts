@@ -350,10 +350,12 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
     return r.status === 0 ? { ok: true } : { ok: false, error: `tui exited ${r.status}` };
   }
 
-  // maw today repo — the day as a PRIVATE repo, created if missing, idempotent after.
-  // Shape proven by hand first (1-sep-tue-2026, 2026-09-01): /awaken vault skeleton,
-  // digest at ψ/memory/days/<slug>.md, gh repo create --private --source --push.
-  if (sub === "repo") {
+  // The day as a PRIVATE repo. Three doors onto one machine:
+  //   new    — CREATE today's capsule; error if it already exists (explicit "start today")
+  //   repo   — REFRESH today's capsule; error if it does not exist yet
+  //   (auto) — create-or-refresh, the original combined behaviour, kept for callers/cron
+  // Split at Nat's request (2026-09-01): `new` is the deliberate birth, `repo` the update.
+  if (sub === "new" || sub === "repo") {
     const buf2: string[] = [];
     const say = async (l: string) => { if (ctx.writer) await ctx.writer(l); else buf2.push(l); };
     const slug = daySlug();
@@ -363,8 +365,16 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
     catch { return { ok: false, error: "ghq not available — cannot place the day repo" }; }
     const dir = join(ghqRoot, "github.com", org, slug);
     const vault = join(dir, "ψ");
+    const scaffolded = existsSync(join(dir, "CLAUDE.md"));
 
-    if (!existsSync(join(dir, "CLAUDE.md"))) {
+    // Guard the two strict doors before touching disk. `new` on an existing day and
+    // `repo` on a missing day are both user errors, not no-ops — say which door to use.
+    if (sub === "new" && scaffolded)
+      return { ok: false, error: `${org}/${slug} already exists — use \`maw today repo\` to refresh it` };
+    if (sub === "repo" && !scaffolded)
+      return { ok: false, error: `no day repo yet for ${slug} — use \`maw today new\` to create it` };
+
+    if (!scaffolded) {
       await say(`▓ new day — scaffolding ${org}/${slug}`);
       for (const d of ["inbox", "outbox", "writing", "lab", "archive",
                        "memory/resonance", "memory/learnings", "memory/retrospectives",
@@ -375,7 +385,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
         writeFileSync(join(vault, d, ".gitkeep"), "");
       writeFileSync(join(dir, "CLAUDE.md"),
         `# ${slug} — a day, kept\n\n` +
-        `> One day of the fleet, captured as a repo. Written by 'maw today repo'\n` +
+        `> One day of the fleet, captured as a repo. Written by 'maw today'\n` +
         `> (neo-oracle, ψ/lab/maw-today), born the same day it describes.\n\n` +
         `A day capsule, not a project: the digest lives at ψ/memory/days/${slug}.md,\n` +
         `and the /awaken-shaped vault holds whatever the day leaves behind — retros,\n` +
@@ -397,12 +407,12 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
     if (staged) {
       await git("commit", "-q", "-m",
         `day: ${slug} — ${commits.length} commits · ${sessions.length} sessions\n\n` +
-        `Written by maw today repo.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>`);
+        `Written by maw today.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>`);
       await say(`▓ committed`);
     } else await say(`▓ nothing new to commit`);
 
-    const exists = await run("gh", ["repo", "view", `${org}/${slug}`, "--json", "name"]).then(() => true).catch(() => false);
-    if (!exists) {
+    const remote = await run("gh", ["repo", "view", `${org}/${slug}`, "--json", "name"]).then(() => true).catch(() => false);
+    if (!remote) {
       // PRIVATE is load-bearing: the digest names private repos and their commit subjects.
       await run("gh", ["repo", "create", `${org}/${slug}`, "--private", "--source", dir, "--push"]);
       await say(`▓ created PRIVATE github.com/${org}/${slug} and pushed`);
@@ -422,7 +432,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   }
 
   if (!["all", "commits", "sessions"].includes(sub)) {
-    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, digest, repo, tui, or all` };
+    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, digest, new, repo, tui, or all` };
   }
 
   let since: { at: number; label: string };
