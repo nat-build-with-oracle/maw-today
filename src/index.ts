@@ -582,21 +582,7 @@ async function syncDayRepo(
 
   if (!scaffolded) {
     await say(`▓ new day — scaffolding ${org}/${repoSlug}`);
-    for (const d of ["inbox", "outbox", "writing", "lab", "archive",
-                     "memory/resonance", "memory/learnings", "memory/retrospectives",
-                     "memory/traces", "memory/days"])
-      mkdirSync(join(vault, d), { recursive: true });
-    for (const d of ["inbox", "outbox", "writing", "lab", "archive", "memory/resonance",
-                     "memory/learnings", "memory/retrospectives", "memory/traces"])
-      writeFileSync(join(vault, d, ".gitkeep"), "");
-    writeFileSync(join(dir, "CLAUDE.md"),
-      `# ${repoSlug} — a day, kept\n\n` +
-      `> One day of the fleet, captured as a repo. Written by 'maw today'\n` +
-      `> (neo-oracle, ψ/lab/maw-today), born the same day it describes.\n\n` +
-      `A day capsule, not a project: the digest lives at ψ/memory/days/${fileSlug}.md,\n` +
-      `and the /awaken-shaped vault holds whatever the day leaves behind — retros,\n` +
-      `learnings, traces, handoffs. Times are local (${tzTag()}).\n\n` +
-      `AI-generated per fleet Rule 6: assembled by an oracle, commissioned by Nat Weerawan.\n`);
+    scaffoldDay(dir, vault, repoSlug, fileSlug);
   } else {
     await say(`▓ day repo exists — refreshing`);
   }
@@ -615,27 +601,52 @@ async function syncDayRepo(
     : ` · gh unreachable`;
   await say(`▓ ${commits.length} commits · ${sessions.length} sessions${ghNote} → ${f}`);
 
+  await commitPushDay(dir, org, repoSlug,
+    `day: ${fileSlug} — ${commits.length} commits · ${sessions.length} sessions`, say);
+  return { ok: true, output: buf.length ? buf.join("\n") : undefined };
+}
+
+/** The /awaken-shaped skeleton + CLAUDE.md for one day repo. Shared by syncDayRepo
+ *  (today) and the plan verb (a FUTURE day, pre-birthed so the plan has a home). */
+function scaffoldDay(dir: string, vault: string, repoSlug: string, fileSlug: string) {
+  for (const d of ["inbox", "outbox", "writing", "lab", "archive",
+                   "memory/resonance", "memory/learnings", "memory/retrospectives",
+                   "memory/traces", "memory/days"])
+    mkdirSync(join(vault, d), { recursive: true });
+  for (const d of ["inbox", "outbox", "writing", "lab", "archive", "memory/resonance",
+                   "memory/learnings", "memory/retrospectives", "memory/traces"])
+    writeFileSync(join(vault, d, ".gitkeep"), "");
+  writeFileSync(join(dir, "CLAUDE.md"),
+    `# ${repoSlug} — a day, kept\n\n` +
+    `> One day of the fleet, captured as a repo. Written by 'maw today'\n` +
+    `> (nat-build-with-oracle/maw-today).\n\n` +
+    `A day capsule, not a project: the digest lives at ψ/memory/days/${fileSlug}.md,\n` +
+    `and the /awaken-shaped vault holds whatever the day leaves behind — retros,\n` +
+    `learnings, traces, handoffs. Times are local (${tzTag()}).\n\n` +
+    `AI-generated per fleet Rule 6: assembled by an oracle, commissioned by Nat Weerawan.\n`);
+}
+
+/** Commit whatever changed in a day repo and push, creating the PRIVATE remote on
+ *  first contact. PRIVATE is load-bearing: digests and plans name private repos. */
+async function commitPushDay(dir: string, org: string, repoSlug: string, subject: string,
+                             say: (l: string) => Promise<void>) {
   const git = (...a: string[]) => run("git", ["-C", dir, ...a]);
   try { await git("rev-parse", "--git-dir"); } catch { await git("init", "-q"); }
   await git("add", "-A");
   const staged = await git("diff", "--cached", "--quiet").then(() => false).catch(() => true);
   if (staged) {
     await git("commit", "-q", "-m",
-      `day: ${fileSlug} — ${commits.length} commits · ${sessions.length} sessions\n\n` +
-      `Written by maw today.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>`);
+      `${subject}\n\nWritten by maw today.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>`);
     await say(`▓ committed`);
   } else await say(`▓ nothing new to commit`);
-
   const remote = await run("gh", ["repo", "view", `${org}/${repoSlug}`, "--json", "name"]).then(() => true).catch(() => false);
   if (!remote) {
-    // PRIVATE is load-bearing: the digest names private repos and their commit subjects.
     await run("gh", ["repo", "create", `${org}/${repoSlug}`, "--private", "--source", dir, "--push"]);
     await say(`▓ created PRIVATE github.com/${org}/${repoSlug} and pushed`);
   } else if (staged) {
     await git("push", "-u", "origin", "HEAD");
     await say(`▓ pushed`);
   }
-  return { ok: true, output: buf.length ? buf.join("\n") : undefined };
 }
 
 export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
@@ -677,6 +688,39 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   // `maw today` runs the same body in `auto` mode after the sessions view (below).
   if (sub === "new" || sub === "repo") return syncDayRepo(ctx, sub, flag("since"));
 
+  // TOMORROW — maw today, but for the day ahead (Nat, 2026-09-01): pre-birth the
+  // day repo so tomorrow already exists when it starts. Same vault, same PRIVATE
+  // repo, NO extra files — whatever belongs in tomorrow goes into its ψ by hand.
+  // --date YYYY-MM-DD aims at any day; default is tomorrow.
+  if (sub === "tomorrow") {
+    const buf2: string[] = [];
+    const say = async (l: string) => { if (ctx.writer) await ctx.writer(l); else buf2.push(l); };
+    const dateSpec = flag("date");
+    let target = new Date();
+    if (dateSpec) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateSpec);
+      if (!m) return { ok: false, error: `cannot parse --date "${dateSpec}" — use YYYY-MM-DD` };
+      target = new Date(+m[1], +m[2] - 1, +m[3]);
+      // JS Date NORMALIZES instead of failing — 2026-13-40 quietly becomes 2027-02-09
+      // (this bug birthed a real repo in testing). A date is real only if it round-trips.
+      if (target.getFullYear() !== +m[1] || target.getMonth() + 1 !== +m[2] || target.getDate() !== +m[3])
+        return { ok: false, error: `not a real date: "${dateSpec}"` };
+    } else target.setDate(target.getDate() + 1);
+    const repoSlug = dayRepoSlug(target), fileSlug = daySlug(target);
+    const org = process.env.MAW_TODAY_ORG || "nat-build-with-oracle";
+    let ghqRoot = "";
+    try { ghqRoot = (await run("ghq", ["root"])).stdout.trim(); }
+    catch { return { ok: false, error: "ghq not available — cannot place the day repo" }; }
+    const dir = join(ghqRoot, "github.com", org, repoSlug);
+    if (existsSync(join(dir, "CLAUDE.md")))
+      return { ok: true, output: `${org}/${repoSlug} already born — ${dir}` };
+    await say(`▓ pre-birthing ${org}/${repoSlug}`);
+    scaffoldDay(dir, join(dir, "ψ"), repoSlug, fileSlug);
+    await commitPushDay(dir, org, repoSlug, `day: ${fileSlug} — born ahead of its day`, say);
+    await say(`▓ ${dir}`);
+    return { ok: true, output: buf2.length ? buf2.join("\n") : undefined };
+  }
+
   if (sub === "digest") {
     const winAt = since0(flag("since"));   // once — see syncDayRepo
     const [commits, sessions, gh] = await Promise.all([
@@ -689,7 +733,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   }
 
   if (!["all", "commits", "sessions", "gh"].includes(sub)) {
-    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, gh, digest, new, repo, tui, or all` };
+    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, gh, digest, tomorrow, new, repo, tui, or all` };
   }
 
   let since: { at: number; label: string };
