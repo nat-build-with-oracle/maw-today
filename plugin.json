@@ -1,0 +1,23 @@
+{
+  "name": "today",
+  "version": "0.1.0",
+  "entry": "./src/index.ts",
+  "sdk": "^1.0.0",
+  "description": "What happened today on this machine — commits across the ghq tree, and Claude Code sessions touched.",
+  "author": "neo-oracle",
+  "cli": {
+    "command": "today",
+    "aliases": [
+      "td"
+    ],
+    "help": "maw today — sessions at a glance · commits (nested repo listing) · all · tui · --since 3d · --json"
+  },
+  "capabilities": [
+    "fs:read"
+  ],
+  "weight": 50,
+  "runtime": "bun-dev",
+  "target": "js",
+  "license": "MIT",
+  "schemaVersion": 1
+}
