@@ -2,7 +2,8 @@
 //
 //   maw today                      sessions since local midnight (fast, one screen)
 //   maw today commits              the nested per-repo commit listing (scans, ~seconds)
-//   maw today all                  both
+//   maw today gh                   the upstream half: PRs opened/merged + issues closed
+//   maw today all                  all three
 //   maw today --since 3d           widen the window (1d | 3d | 2h | YYYY-MM-DD)
 //   maw today --json               machine-readable
 //
@@ -74,6 +75,11 @@ export function resolveSince(spec?: string): { at: number; label: string } {
     const mult = rel[2] === "d" ? 86400e3 : rel[2] === "h" ? 3600e3 : 60e3;
     return { at: Date.now() - n * mult, label: `last ${spec}` };
   }
+  // A bare date must mean LOCAL midnight: Date.parse("2026-09-01") is UTC midnight per
+  // ECMAScript, which in +07 starts the window at 07:00 and silently drops the first
+  // seven hours of the requested calendar day — while the label claims the full day.
+  const ymd = /^(\d{4})-(\d{2})-(\d{2})$/.exec(spec);
+  if (ymd) return { at: new Date(+ymd[1], +ymd[2] - 1, +ymd[3]).getTime(), label: `since ${spec}` };
   const t = Date.parse(spec);
   if (!Number.isNaN(t)) return { at: t, label: `since ${spec}` };
   // An unparseable --since must not silently become "today" — that would report a
@@ -209,6 +215,90 @@ export async function sessionsToday(since: number): Promise<Session[]> {
   return out.sort((a, b) => a.at - b.at);
 }
 
+// ---- github: the upstream half ----------------------------------------------
+
+export type GhItem = {
+  kind: "pr-opened" | "pr-merged" | "issue-closed";
+  repo: string; number: number; title: string; author: string; at: number; url: string;
+};
+
+/** Fleet owners for the upstream search. Owner-scoped is LOAD-BEARING: `--involves`
+ *  misses every bot/oracle-authored PR — probed 2026-09-01: owner-scoped on just 2 of
+ *  6 orgs found MORE rows (11) than --involves across all of GitHub (9). All owners fit
+ *  ONE query: GitHub's documented 5-clause cap is boolean operators, not repeated
+ *  owner qualifiers (6 tested clean). */
+const ghOwners = () => {
+  // `||` not `??`: an EMPTY env var must fall back too — with ?? it would strip every
+  // --owner flag and silently search all of GitHub, rendering strangers' PRs as the
+  // fleet's day. Same guard on a whitespace-only value.
+  const list = (process.env.MAW_TODAY_OWNERS || "laris-co,Soul-Brews-Studio,nat-build-with-oracle,DustBoy-PM25,FloodBoy-CM,nazt")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  if (!list.length) throw new Error("MAW_TODAY_OWNERS is set but holds no owner — an ownerless search is all of GitHub");
+  return list;
+};
+
+/**
+ * PRs opened, PRs merged, issues closed since `since` — the Workshop-03 upstream half:
+ * commits alone hid maw-js's sprint day (229 commits read as blobs until 198 opened /
+ * 173 merged / 125 closed revealed a team closeout). Three parallel searches, ~3s wall,
+ * 3 of the 30/min search budget. The date is a full ISO instant — honored server-side
+ * (boundary-probed), so no bare-date UTC-midnight truncation trap.
+ * THROWS on any failure instead of returning fake zeros: a category emptied by a
+ * network error is exactly the false-zero Odin's flights exist to catch.
+ */
+export type GhDay = { items: GhItem[]; truncated: boolean };
+
+export async function ghToday(since: number): Promise<GhDay> {
+  const iso = `>=${new Date(since).toISOString()}`;
+  const owners = ghOwners().flatMap((o) => ["--owner", o]);
+  // 1000 is gh's hard max. rows.length === LIMIT means MORE existed — the motivating
+  // sprint day (198/173/125) fit inside the old 100 cap in NO category, and a saturated
+  // page under best-match sort is an arbitrary subset. --sort created makes the kept
+  // rows at least newest-first, and `truncated` turns every count into a stated floor.
+  const LIMIT = 1000;
+  const search = async (type: "prs" | "issues", dateFlag: string, kind: GhItem["kind"]) => {
+    const { stdout } = await run("gh",
+      ["search", type, dateFlag, iso, ...owners, "--sort", "created",
+       "--json", "repository,number,title,author,createdAt,updatedAt,closedAt,url", "--limit", String(LIMIT)],
+      { maxBuffer: 64 << 20 });
+    const rows = JSON.parse(stdout) as any[];
+    const items: GhItem[] = rows.map((r) => ({
+      kind,
+      repo: r.repository?.nameWithOwner ?? r.repository?.name ?? "?",
+      number: r.number,
+      title: r.title ?? "",
+      author: r.author?.login ?? "?",
+      // createdAt for opened; closedAt for merged/closed — for a merged PR closedAt IS
+      // the merge instant, while updatedAt drifts to the last touch of any kind and
+      // bends the braid's causality adjacency. 0 = unparseable, rendered "--:--",
+      // never a fabricated plausible time.
+      at: Date.parse((kind === "pr-opened" ? r.createdAt : r.closedAt ?? r.updatedAt) ?? "") || 0,
+      url: r.url ?? "",
+    }));
+    return { items, truncated: rows.length === LIMIT };
+  };
+  const [opened, merged, closed] = await Promise.all([
+    search("prs", "--created", "pr-opened"),
+    search("prs", "--merged-at", "pr-merged"),
+    search("issues", "--closed", "issue-closed"),
+  ]);
+  // A PR opened AND merged today appears twice — that is two events, kept deliberately.
+  return {
+    items: [...opened.items, ...merged.items, ...closed.items].sort((a, b) => a.at - b.at),
+    truncated: opened.truncated || merged.truncated || closed.truncated,
+  };
+}
+
+export const GH_MARK: Record<GhItem["kind"], string> = {
+  "pr-opened": "⇧ PR", "pr-merged": "✓ PR", "issue-closed": "⊘ issue",
+};
+
+const ghCounts = (gh: GhItem[]) => ({
+  opened: gh.filter((g) => g.kind === "pr-opened").length,
+  merged: gh.filter((g) => g.kind === "pr-merged").length,
+  closed: gh.filter((g) => g.kind === "issue-closed").length,
+});
+
 // ---- digest -----------------------------------------------------------------
 
 const hhmmLocal = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
@@ -237,7 +327,11 @@ const fmtGap = (ms: number) => {
   return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
 };
 
-export function writeDigest(commits: Commit[], sessions: Session[], label: string, vaultDir?: string): string {
+/** `gh` honesty levels: GhDay = gathered (items may be empty = a real zero; truncated
+ *  makes counts floors) · null = tried and unreachable · undefined = this caller does
+ *  not gather github. The digest SAYS which — a missing half must never read as a
+ *  quiet day. */
+export function writeDigest(commits: Commit[], sessions: Session[], label: string, vaultDir?: string, gh?: GhDay | null): string {
   const psi = vaultDir ?? dayVaultDir();
   // Day slug: "1-sep-tue-2026" — deliberately NOT ISO: these are for a human flipping
   // through a folder; the ls-sorting trade is accepted. Shared builder — see daySlug().
@@ -254,7 +348,15 @@ export function writeDigest(commits: Commit[], sessions: Session[], label: strin
   // oracle's job; code only refuses to fake it.
   L.push(`window: ${label} · written ${hhmmLocal(Date.now())} ${tzTag()}`, "");
   const projects = new Set(sessions.map((s) => s.project)).size;
-  L.push(`${commits.length} commits · ${repos} repos · ${sessions.length} sessions · ${projects} projects`, "");
+  L.push(`${commits.length} commits · ${repos} repos · ${sessions.length} sessions · ${projects} projects`);
+  // The Workshop-03 canonical columns, one line: commits alone hide a sprint day.
+  if (gh) {
+    const n = ghCounts(gh.items);
+    L.push(`upstream: ${n.opened} PRs opened · ${n.merged} merged · ${n.closed} issues closed` +
+      (gh.truncated ? " — TRUNCATED at 1000/category, counts are floors" : ""));
+  } else if (gh === null) L.push(`upstream: github unreachable this write — the gh half is MISSING, not zero`);
+  else L.push(`upstream: not gathered by this writer`);
+  L.push("");
 
   if (commits.length) {
     L.push(`## The day's shape`, "");
@@ -297,13 +399,19 @@ export function writeDigest(commits: Commit[], sessions: Session[], label: strin
     L.push("```", "");
   }
 
-  // Time-ordered feed, org inline. Org HEADERS were tried and produced repeats — the
-  // commits here are sorted by TIME (that is the day's story), so orgs interleave and
-  // a header-per-change fires constantly. The nested org view lives in `maw today
-  // commits`, which sorts by repo; this file reads chronologically, Huginn-style.
-  L.push(`## Commits`, "");
-  for (const c of commits)
-    L.push(`- ${hhmmLocal(c.at)} \`${c.hash}\` ${lastTwo(c.repo)} — ${c.subject}`);
+  // The BRAID — Workshop-03's gold shape: commits, PRs, and issues merged onto ONE
+  // timestamp axis so causality sits adjacent (issue-open next to its fixing commit
+  // next to the PR-merge; a 13-minute bug→fix gap is visible here and in no
+  // per-section view). Org headers were tried and produced repeats — time-sorted
+  // events interleave orgs; the nested org view lives in `maw today commits`.
+  L.push(`## Timeline`, "");
+  const evs: { at: number; line: string }[] = commits.map((c) => ({
+    at: c.at, line: `- ${hhmmLocal(c.at)} \`${c.hash}\` ${lastTwo(c.repo)} — ${c.subject}`,
+  }));
+  for (const g of gh?.items ?? [])
+    evs.push({ at: g.at, line: `- ${g.at ? hhmmLocal(g.at) : "--:--"} **${GH_MARK[g.kind]}** [${g.repo}#${g.number}](${g.url}) — ${g.title} (${g.author})` });
+  evs.sort((a, b) => a.at - b.at);
+  for (const e of evs) L.push(e.line);
   L.push("", `## Sessions`, "");
   // The id is a LINK to the session's jsonl (file:// — clickable in VS Code/Obsidian;
   // inert on github.com, accepted: the digest is read locally, the repo is just its home).
@@ -440,9 +548,18 @@ async function syncDayRepo(
   }
 
   await say(`▓ gathering the day…`);
-  const [commits, sessions] = await Promise.all([gitToday(since0(sinceSpec)), sessionsToday(since0(sinceSpec))]);
-  const f = writeDigest(commits, sessions, resolveSince(sinceSpec).label, vault);
-  await say(`▓ ${commits.length} commits · ${sessions.length} sessions → ${f}`);
+  // Resolve the window ONCE — three since0() calls re-anchor relative specs to now()
+  // milliseconds apart, and "the same window" should be literally the same number.
+  const winAt = since0(sinceSpec);
+  const [commits, sessions, gh] = await Promise.all([
+    gitToday(winAt), sessionsToday(winAt),
+    ghToday(winAt).catch(() => null),   // null = unreachable; digest says so
+  ]);
+  const f = writeDigest(commits, sessions, resolveSince(sinceSpec).label, vault, gh);
+  const ghNote = gh
+    ? (() => { const n = ghCounts(gh.items); return ` · ${n.opened}⇧ ${n.merged}✓ ${n.closed}⊘${gh.truncated ? " (floors)" : ""}`; })()
+    : ` · gh unreachable`;
+  await say(`▓ ${commits.length} commits · ${sessions.length} sessions${ghNote} → ${f}`);
 
   const git = (...a: string[]) => run("git", ["-C", dir, ...a]);
   try { await git("rev-parse", "--git-dir"); } catch { await git("init", "-q"); }
@@ -507,15 +624,18 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   if (sub === "new" || sub === "repo") return syncDayRepo(ctx, sub, flag("since"));
 
   if (sub === "digest") {
-    const [commits, sessions] = await Promise.all([gitToday(since0(flag("since"))), sessionsToday(since0(flag("since")))]);
+    const winAt = since0(flag("since"));   // once — see syncDayRepo
+    const [commits, sessions, gh] = await Promise.all([
+      gitToday(winAt), sessionsToday(winAt), ghToday(winAt).catch(() => null),
+    ]);
     try {
-      const f = writeDigest(commits, sessions, resolveSince(flag("since")).label);
+      const f = writeDigest(commits, sessions, resolveSince(flag("since")).label, undefined, gh);
       return { ok: true, output: `${commits.length} commits · ${sessions.length} sessions\ndigest → ${f}` };
     } catch (e) { return { ok: false, error: String((e as Error).message) }; }
   }
 
-  if (!["all", "commits", "sessions"].includes(sub)) {
-    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, digest, new, repo, tui, or all` };
+  if (!["all", "commits", "sessions", "gh"].includes(sub)) {
+    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, gh, digest, new, repo, tui, or all` };
   }
 
   let since: { at: number; label: string };
@@ -527,15 +647,25 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
 
   const wantCommits = sub === "all" || sub === "commits";
   const wantSessions = sub === "all" || sub === "sessions";
+  const wantGh = sub === "all" || sub === "gh";
 
   // --json stays a single blob — a consumer parsing a stream of fragments is worse
-  // than a consumer waiting four seconds.
+  // than a consumer waiting four seconds. gh failure surfaces as ghError, never as [].
   if (json) {
-    const [commits, sessions] = await Promise.all([
+    const [commits, sessions, gh] = await Promise.all([
       wantCommits ? gitToday(since.at) : Promise.resolve(null),
       wantSessions ? sessionsToday(since.at) : Promise.resolve(null),
+      wantGh ? ghToday(since.at).catch((e) => ({ ghError: String((e as Error).message) })) : Promise.resolve(null),
     ]);
-    return { ok: true, output: JSON.stringify({ since: since.at, label: since.label, commits, sessions }, null, 2) };
+    // gh mirrors commits/sessions symmetry: null when not requested AND on failure —
+    // a consumer's `payload.gh ?? []` must never manufacture a false zero silently,
+    // so failure carries ghError alongside the null.
+    const payload: Record<string, unknown> = { since: since.at, label: since.label, commits, sessions, gh: null };
+    if (wantGh && gh) {
+      if ("items" in gh) { payload.gh = gh.items; payload.ghTruncated = gh.truncated; }
+      else payload.ghError = (gh as { ghError: string }).ghError;
+    }
+    return { ok: true, output: JSON.stringify(payload, null, 2) };
   }
 
   // FEED, not report. The first version gathered everything and returned one string
@@ -546,7 +676,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   const buf: string[] = [];
   const emit = async (line = "") => { if (ctx.writer) await ctx.writer(line); else buf.push(line); };
 
-  await emit(`maw today — ${daySlug()}${since.label === "today" ? "" : ` · ${since.label}`} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })} +07`);
+  await emit(`maw today — ${daySlug()}${since.label === "today" ? "" : ` · ${since.label}`} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })} ${tzTag()}`);
 
   let sessions: Session[] | null = null;
   if (wantSessions) {
@@ -597,6 +727,22 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
     await emit();
     await emit(`${commits.length} commit${commits.length === 1 ? "" : "s"} across ${repos} repo${repos === 1 ? "" : "s"}` +
       (sessions ? ` · ${sessions.length} session${sessions.length === 1 ? "" : "s"}` : ""));
+  }
+
+  // The upstream half — Workshop-03's missing columns. Failure prints as unreachable,
+  // never as a quiet zero.
+  if (wantGh) {
+    await emit();
+    try {
+      const gh = await ghToday(since.at);
+      const n = ghCounts(gh.items);
+      await emit(`github    ${n.opened} PR${n.opened === 1 ? "" : "s"} opened · ${n.merged} merged · ${n.closed} issue${n.closed === 1 ? "" : "s"} closed` +
+        (gh.truncated ? " — TRUNCATED at 1000/category, counts are floors" : ""));
+      for (const g of gh.items)
+        await emit(`  ${g.at ? hhmm(g.at) : "--:--"}  ${GH_MARK[g.kind].padEnd(7)} ${g.repo}#${g.number} — ${g.title.slice(0, 64)} (${g.author})`);
+    } catch (e) {
+      await emit(`github    unreachable — ${String((e as Error).message).split("\n")[0].slice(0, 100)}`);
+    }
   }
 
   return { ok: true, output: buf.length ? buf.join("\n") : undefined };

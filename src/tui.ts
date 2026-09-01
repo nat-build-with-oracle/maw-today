@@ -14,7 +14,7 @@
 // 2026-05-12_clear-beats-pipe-for-tui).
 
 import { spawnSync } from "node:child_process";
-import { gitToday, sessionsToday, resolveSince, writeDigest, daySlug, type Commit, type Session } from "./index.ts";
+import { gitToday, sessionsToday, ghToday, resolveSince, writeDigest, daySlug, type Commit, type Session } from "./index.ts";
 
 // ---- terminal IO ------------------------------------------------------------
 // Run directly, stdin/stdout ARE the terminal. Run through maw, they are PIPES (that
@@ -235,10 +235,15 @@ function stepWindow(dir: 1 | -1) {
 }
 
 // ---- digest -----------------------------------------------------------------
-// Thin shim over the SHARED writer in index.ts — one format, two doors.
-function writeDigestNote(): string {
-  try { return `digest → ${writeDigest(S.commits, S.sessions, S.label)}`; }
-  catch (e) { return String((e as Error).message); }
+// Thin shim over the SHARED writer in index.ts — one format, two doors. Async because
+// the digest gathers the gh half (three searches, ~3s): a TUI-written digest missing
+// upstream while the verb-written one carries it is the drift-between-twins bug.
+// gh failure passes null so the digest SAYS unreachable instead of faking a zero.
+async function writeDigestNote(): Promise<string> {
+  try {
+    const gh = await ghToday(resolveSince(S.sinceSpec).at).catch(() => null);
+    return `digest → ${writeDigest(S.commits, S.sessions, S.label, undefined, gh)}`;
+  } catch (e) { return String((e as Error).message); }
 }
 
 // ---- lifecycle --------------------------------------------------------------
@@ -289,7 +294,10 @@ IN.on("data", (key: string) => {
     case "r": load(); break;
     case "+": case "=": stepWindow(1); break;
     case "-": stepWindow(-1); break;
-    case "w": S.note = writeDigestNote(); draw(); break;
+    case "w":
+      S.note = "writing digest (gathering github…)"; draw();
+      writeDigestNote().then((n) => { S.note = n; draw(); });
+      break;
     case "\r": {
       // Arm the prompt, don't act yet. Only commit rows carry a real path; a session
       // row's project name is decoded from ~/.claude/projects/<encoded> where "-"
