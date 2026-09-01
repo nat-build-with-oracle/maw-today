@@ -228,7 +228,7 @@ export function dayVaultDir(): string {
   const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
   const ghqRoot = execFileSync("ghq", ["root"], { encoding: "utf8" }).trim();
   const org = process.env.MAW_TODAY_ORG || "nat-build-with-oracle";
-  return join(ghqRoot, "github.com", org, daySlug(), "ψ");
+  return join(ghqRoot, "github.com", org, dayRepoSlug(), "ψ");
 }
 
 export function writeDigest(commits: Commit[], sessions: Session[], label: string, vaultDir?: string): string {
@@ -321,6 +321,96 @@ export function daySlug(d = new Date()): string {
          d.toLocaleString("en", { weekday: "short" }).toLowerCase();
 }
 
+/** The day's REPO name — an oracle: "1sep-tue2026-oracle" (Nat, 2026-09-01). daySlug
+ *  names the digest FILE inside; this names the repo/dir/remote that carries it. The
+ *  year is present here (unlike daySlug) so repo names never collide across years, and
+ *  the `-oracle` suffix marks it a member of the fleet, not a stray dated folder. */
+export function dayRepoSlug(d = new Date()): string {
+  return `${daySlug(d)}${d.getFullYear()}-oracle`;
+}
+
+/**
+ * Create-or-refresh the day's PRIVATE repo and push. Extracted so three callers share
+ * ONE body — the `new`/`repo` verbs and the default `maw today` auto-sync — because the
+ * drift-between-twins bug (two paths doing the same job, one fixed) is this fleet's most
+ * repeated. `mode` only changes the pre-flight guard:
+ *   new    error if the day already exists (explicit "start today")
+ *   repo   error if it does not exist yet (explicit "update today")
+ *   auto   neither guard — create if missing, refresh if present (the bare `maw today`)
+ */
+async function syncDayRepo(
+  ctx: InvokeContext,
+  mode: "new" | "repo" | "auto",
+  sinceSpec?: string,
+): Promise<InvokeResult> {
+  const buf: string[] = [];
+  const say = async (l: string) => { if (ctx.writer) await ctx.writer(l); else buf.push(l); };
+  const repoSlug = dayRepoSlug();      // the repo/dir/remote — 1sep-tue2026-oracle
+  const fileSlug = daySlug();          // the digest file inside — 1sep-tue.md
+  const org = process.env.MAW_TODAY_ORG || "nat-build-with-oracle";
+  let ghqRoot = "";
+  try { ghqRoot = (await run("ghq", ["root"])).stdout.trim(); }
+  catch { return { ok: false, error: "ghq not available — cannot place the day repo" }; }
+  const dir = join(ghqRoot, "github.com", org, repoSlug);
+  const vault = join(dir, "ψ");
+  const scaffolded = existsSync(join(dir, "CLAUDE.md"));
+
+  // Guard the two strict doors before touching disk. `new` on an existing day and
+  // `repo` on a missing day are both user errors, not no-ops — say which door to use.
+  if (mode === "new" && scaffolded)
+    return { ok: false, error: `${org}/${repoSlug} already exists — use \`maw today repo\` to refresh it` };
+  if (mode === "repo" && !scaffolded)
+    return { ok: false, error: `no day repo yet for ${repoSlug} — use \`maw today new\` to create it` };
+
+  if (!scaffolded) {
+    await say(`▓ new day — scaffolding ${org}/${repoSlug}`);
+    for (const d of ["inbox", "outbox", "writing", "lab", "archive",
+                     "memory/resonance", "memory/learnings", "memory/retrospectives",
+                     "memory/traces", "memory/days"])
+      mkdirSync(join(vault, d), { recursive: true });
+    for (const d of ["inbox", "outbox", "writing", "lab", "archive", "memory/resonance",
+                     "memory/learnings", "memory/retrospectives", "memory/traces"])
+      writeFileSync(join(vault, d, ".gitkeep"), "");
+    writeFileSync(join(dir, "CLAUDE.md"),
+      `# ${repoSlug} — a day, kept\n\n` +
+      `> One day of the fleet, captured as a repo. Written by 'maw today'\n` +
+      `> (neo-oracle, ψ/lab/maw-today), born the same day it describes.\n\n` +
+      `A day capsule, not a project: the digest lives at ψ/memory/days/${fileSlug}.md,\n` +
+      `and the /awaken-shaped vault holds whatever the day leaves behind — retros,\n` +
+      `learnings, traces, handoffs. Times are local (${tzTag()}).\n\n` +
+      `AI-generated per fleet Rule 6: assembled by an oracle, commissioned by Nat Weerawan.\n`);
+  } else {
+    await say(`▓ day repo exists — refreshing`);
+  }
+
+  await say(`▓ gathering the day…`);
+  const [commits, sessions] = await Promise.all([gitToday(since0(sinceSpec)), sessionsToday(since0(sinceSpec))]);
+  const f = writeDigest(commits, sessions, resolveSince(sinceSpec).label, vault);
+  await say(`▓ ${commits.length} commits · ${sessions.length} sessions → ${f}`);
+
+  const git = (...a: string[]) => run("git", ["-C", dir, ...a]);
+  try { await git("rev-parse", "--git-dir"); } catch { await git("init", "-q"); }
+  await git("add", "-A");
+  const staged = await git("diff", "--cached", "--quiet").then(() => false).catch(() => true);
+  if (staged) {
+    await git("commit", "-q", "-m",
+      `day: ${fileSlug} — ${commits.length} commits · ${sessions.length} sessions\n\n` +
+      `Written by maw today.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>`);
+    await say(`▓ committed`);
+  } else await say(`▓ nothing new to commit`);
+
+  const remote = await run("gh", ["repo", "view", `${org}/${repoSlug}`, "--json", "name"]).then(() => true).catch(() => false);
+  if (!remote) {
+    // PRIVATE is load-bearing: the digest names private repos and their commit subjects.
+    await run("gh", ["repo", "create", `${org}/${repoSlug}`, "--private", "--source", dir, "--push"]);
+    await say(`▓ created PRIVATE github.com/${org}/${repoSlug} and pushed`);
+  } else if (staged) {
+    await git("push", "-u", "origin", "HEAD");
+    await say(`▓ pushed`);
+  }
+  return { ok: true, output: buf.length ? buf.join("\n") : undefined };
+}
+
 export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   const args = asArgs(ctx.args);
   const flag = (n: string) => {
@@ -331,7 +421,12 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   // Default is the FIRST SECTION only (Nat, 2026-09-01): sessions are instant, while
   // the commit scan costs seconds and a screenful. The long nested listing lives under
   // its own verb; plain `maw today` answers at a glance.
-  const sub = args.find((a) => !a.startsWith("--") && !["1d", "3d"].includes(a)) ?? "sessions";
+  const verb = args.find((a) => !a.startsWith("--") && !["1d", "3d"].includes(a));
+  const sub = verb ?? "sessions";
+  // Bare `maw today` (no verb) shows the sessions glance, THEN auto-syncs the day repo
+  // (Nat, 2026-09-01: "the output of maw today should show this first … then auto append").
+  // An explicit `maw today sessions|commits|all` must NOT write — a read verb stays a read.
+  const isDefault = verb === undefined && !json;
 
   // The TUI owns the terminal, so it cannot draw through this {ok, output} contract —
   // it runs as its own process, the same shape as atlas's bf-tui. But "inherit" is NOT
@@ -350,78 +445,10 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
     return r.status === 0 ? { ok: true } : { ok: false, error: `tui exited ${r.status}` };
   }
 
-  // The day as a PRIVATE repo. Three doors onto one machine:
-  //   new    — CREATE today's capsule; error if it already exists (explicit "start today")
-  //   repo   — REFRESH today's capsule; error if it does not exist yet
-  //   (auto) — create-or-refresh, the original combined behaviour, kept for callers/cron
-  // Split at Nat's request (2026-09-01): `new` is the deliberate birth, `repo` the update.
-  if (sub === "new" || sub === "repo") {
-    const buf2: string[] = [];
-    const say = async (l: string) => { if (ctx.writer) await ctx.writer(l); else buf2.push(l); };
-    const slug = daySlug();
-    const org = process.env.MAW_TODAY_ORG || "nat-build-with-oracle";
-    let ghqRoot = "";
-    try { ghqRoot = (await run("ghq", ["root"])).stdout.trim(); }
-    catch { return { ok: false, error: "ghq not available — cannot place the day repo" }; }
-    const dir = join(ghqRoot, "github.com", org, slug);
-    const vault = join(dir, "ψ");
-    const scaffolded = existsSync(join(dir, "CLAUDE.md"));
-
-    // Guard the two strict doors before touching disk. `new` on an existing day and
-    // `repo` on a missing day are both user errors, not no-ops — say which door to use.
-    if (sub === "new" && scaffolded)
-      return { ok: false, error: `${org}/${slug} already exists — use \`maw today repo\` to refresh it` };
-    if (sub === "repo" && !scaffolded)
-      return { ok: false, error: `no day repo yet for ${slug} — use \`maw today new\` to create it` };
-
-    if (!scaffolded) {
-      await say(`▓ new day — scaffolding ${org}/${slug}`);
-      for (const d of ["inbox", "outbox", "writing", "lab", "archive",
-                       "memory/resonance", "memory/learnings", "memory/retrospectives",
-                       "memory/traces", "memory/days"])
-        mkdirSync(join(vault, d), { recursive: true });
-      for (const d of ["inbox", "outbox", "writing", "lab", "archive", "memory/resonance",
-                       "memory/learnings", "memory/retrospectives", "memory/traces"])
-        writeFileSync(join(vault, d, ".gitkeep"), "");
-      writeFileSync(join(dir, "CLAUDE.md"),
-        `# ${slug} — a day, kept\n\n` +
-        `> One day of the fleet, captured as a repo. Written by 'maw today'\n` +
-        `> (neo-oracle, ψ/lab/maw-today), born the same day it describes.\n\n` +
-        `A day capsule, not a project: the digest lives at ψ/memory/days/${slug}.md,\n` +
-        `and the /awaken-shaped vault holds whatever the day leaves behind — retros,\n` +
-        `learnings, traces, handoffs. Times are local (${tzTag()}).\n\n` +
-        `AI-generated per fleet Rule 6: assembled by an oracle, commissioned by Nat Weerawan.\n`);
-    } else {
-      await say(`▓ day repo exists — refreshing`);
-    }
-
-    await say(`▓ gathering the day…`);
-    const [commits, sessions] = await Promise.all([gitToday(since0(flag("since"))), sessionsToday(since0(flag("since")))]);
-    const f = writeDigest(commits, sessions, resolveSince(flag("since")).label, vault);
-    await say(`▓ ${commits.length} commits · ${sessions.length} sessions → ${f}`);
-
-    const git = (...a: string[]) => run("git", ["-C", dir, ...a]);
-    try { await git("rev-parse", "--git-dir"); } catch { await git("init", "-q"); }
-    await git("add", "-A");
-    const staged = await git("diff", "--cached", "--quiet").then(() => false).catch(() => true);
-    if (staged) {
-      await git("commit", "-q", "-m",
-        `day: ${slug} — ${commits.length} commits · ${sessions.length} sessions\n\n` +
-        `Written by maw today.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>`);
-      await say(`▓ committed`);
-    } else await say(`▓ nothing new to commit`);
-
-    const remote = await run("gh", ["repo", "view", `${org}/${slug}`, "--json", "name"]).then(() => true).catch(() => false);
-    if (!remote) {
-      // PRIVATE is load-bearing: the digest names private repos and their commit subjects.
-      await run("gh", ["repo", "create", `${org}/${slug}`, "--private", "--source", dir, "--push"]);
-      await say(`▓ created PRIVATE github.com/${org}/${slug} and pushed`);
-    } else if (staged) {
-      await git("push", "-u", "origin", "HEAD");
-      await say(`▓ pushed`);
-    }
-    return { ok: true, output: buf2.length ? buf2.join("\n") : undefined };
-  }
+  // The day as a PRIVATE repo — see syncDayRepo. `new` and `repo` are the strict doors
+  // (Nat, 2026-09-01): `new` the deliberate birth, `repo` the update. The bare
+  // `maw today` runs the same body in `auto` mode after the sessions view (below).
+  if (sub === "new" || sub === "repo") return syncDayRepo(ctx, sub, flag("since"));
 
   if (sub === "digest") {
     const [commits, sessions] = await Promise.all([gitToday(since0(flag("since"))), sessionsToday(since0(flag("since")))]);
@@ -476,6 +503,16 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
       for (const s of sessions) await emit(`  ${hhmm(s.at)}  ${s.id}  ${short(s.project).padEnd(28)} ${bytes(s.bytes)}`);
     }
     if (!wantCommits) await emit(`\ncommits: maw today commits · both: maw today all · live: maw today tui`);
+  }
+
+  // Bare `maw today`: after the glance is flushed, auto-sync the day repo and append its
+  // lines. syncDayRepo streams through the SAME ctx.writer, so the sessions view lands
+  // first, then the ▓ create/refresh lines — the ordering Nat asked for.
+  if (isDefault) {
+    await emit();
+    const r = await syncDayRepo(ctx, "auto", flag("since"));
+    if (r.error) { const l = `✗ ${r.error}`; if (ctx.writer) await emit(l); else buf.push(l); }
+    else if (!ctx.writer && r.output) buf.push(r.output);
   }
 
   let commits: Commit[] = [];
