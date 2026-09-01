@@ -174,7 +174,7 @@ export async function gitToday(
 
 // ---- sessions ---------------------------------------------------------------
 
-export type Session = { project: string; id: string; at: number; bytes: number };
+export type Session = { project: string; id: string; at: number; bytes: number; file: string };
 
 /**
  * Claude Code writes one JSONL per session under ~/.claude/projects/<encoded-cwd>/.
@@ -201,7 +201,7 @@ export async function sessionsToday(since: number): Promise<Session[]> {
       try {
         const s = await stat(join(root, d, f));
         if (s.mtimeMs >= since) {
-          out.push({ project: d.replace(/^-/, "/").replace(/-/g, "/"), id: f.slice(0, 8), at: s.mtimeMs, bytes: s.size });
+          out.push({ project: d.replace(/^-/, "/").replace(/-/g, "/"), id: f.slice(0, 8), at: s.mtimeMs, bytes: s.size, file: join(root, d, f) });
         }
       } catch { /* vanished mid-scan; not fatal */ }
     }
@@ -305,7 +305,10 @@ export function writeDigest(commits: Commit[], sessions: Session[], label: strin
   for (const c of commits)
     L.push(`- ${hhmmLocal(c.at)} \`${c.hash}\` ${lastTwo(c.repo)} — ${c.subject}`);
   L.push("", `## Sessions`, "");
-  for (const s of sessions) L.push(`- ${hhmmLocal(s.at)} \`${s.id}\` ${lastTwo(s.project)} (${fmtBytes(s.bytes)})`);
+  // The id is a LINK to the session's jsonl (file:// — clickable in VS Code/Obsidian;
+  // inert on github.com, accepted: the digest is read locally, the repo is just its home).
+  for (const s of sessions)
+    L.push(`- ${hhmmLocal(s.at)} [\`${s.id}\`](file://${encodeURI(s.file)}) ${lastTwo(s.project)} (${fmtBytes(s.bytes)})`);
   L.push("", `_written by maw today digest, ${new Date().toISOString()}_`, "");
   writeFileSync(f, L.join("\n"));
   return f;
