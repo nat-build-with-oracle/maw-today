@@ -14,10 +14,7 @@
 // 2026-05-12_clear-beats-pipe-for-tui).
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, realpathSync, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { gitToday, sessionsToday, resolveSince, type Commit, type Session } from "./index.ts";
+import { gitToday, sessionsToday, resolveSince, writeDigest, daySlug, type Commit, type Session } from "./index.ts";
 
 if (!process.stdin.isTTY || !process.stdout.isTTY) {
   console.error("maw today tui needs a real terminal (interactive tty) — pipes make a TUI deaf");
@@ -94,7 +91,7 @@ function draw() {
   const lines: string[] = [];
   const repoN = new Set(S.commits.map((c) => c.repo)).size;
   const projN = new Set(S.sessions.map((s) => s.project)).size;
-  const left = ` ${A.bold}maw today${A.off} ${A.dim}${S.label}${A.off}  ${A.grn}${S.commits.length}${A.off} commits/${repoN}  ${A.cyan}${S.sessions.length}${A.off} sessions/${projN}`;
+  const left = ` ${A.bold}maw today${A.off} ${A.yel}${daySlug()}${A.off} ${A.dim}${S.label}${A.off}  ${A.grn}${S.commits.length}${A.off} commits/${repoN}  ${A.cyan}${S.sessions.length}${A.off} sessions/${projN}`;
   const right = S.loading ? `${A.yel}loading…${A.off} ` : `${A.dim}${hhmm(S.loadedAt)}${A.off} `;
   const leftW = wid(left.replace(/\x1b\[[0-9;]*m/g, ""));
   const rightW = wid(right.replace(/\x1b\[[0-9;]*m/g, ""));
@@ -175,27 +172,10 @@ function stepWindow(dir: 1 | -1) {
 }
 
 // ---- digest -----------------------------------------------------------------
-// The caretaker act: write today into the psi vault. psi is a LINK (self-contained by
-// default; repointable at neo's or nexus's ψ), so where this lands is a one-symlink
-// decision, not a code change — see CLAUDE.md "The psi link".
-function writeDigest(): string {
-  const root = dirname(dirname(realpathSync(fileURLToPath(import.meta.url))));
-  const psi = join(root, "psi");
-  if (!existsSync(psi)) return "no psi link beside the plugin — see CLAUDE.md";
-  const day = new Date().toISOString().slice(0, 10);
-  const dir = join(psi, "memory", "days");
-  mkdirSync(dir, { recursive: true });
-  const f = join(dir, `${day}.md`);
-  const L: string[] = [];
-  L.push(`# ${day} — ${S.label}`, "");
-  L.push(`${S.commits.length} commits · ${new Set(S.commits.map((c) => c.repo)).size} repos · ${S.sessions.length} sessions`, "");
-  L.push(`## Commits`, "");
-  for (const c of S.commits) L.push(`- ${hhmm(c.at)} \`${c.hash}\` ${short(c.repo)} — ${c.subject}`);
-  L.push("", `## Sessions`, "");
-  for (const s of S.sessions) L.push(`- ${hhmm(s.at)} \`${s.id}\` ${short(s.project)} (${bytes(s.bytes)})`);
-  L.push("", `_written by maw today tui, ${new Date().toISOString()}_`, "");
-  writeFileSync(f, L.join("\n"));
-  return `digest → ${f}`;
+// Thin shim over the SHARED writer in index.ts — one format, two doors.
+function writeDigestNote(): string {
+  try { return `digest → ${writeDigest(S.commits, S.sessions, S.label)}`; }
+  catch (e) { return String((e as Error).message); }
 }
 
 // ---- lifecycle --------------------------------------------------------------
@@ -245,7 +225,7 @@ process.stdin.on("data", (key: string) => {
     case "r": load(); break;
     case "+": case "=": stepWindow(1); break;
     case "-": stepWindow(-1); break;
-    case "w": S.note = writeDigest(); draw(); break;
+    case "w": S.note = writeDigestNote(); draw(); break;
     case "\r": {
       // Arm the prompt, don't act yet. Only commit rows carry a real path; a session
       // row's project name is decoded from ~/.claude/projects/<encoded> where "-"

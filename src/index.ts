@@ -31,7 +31,9 @@
 
 import { execFile } from "node:child_process";
 import { stat, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync, existsSync, realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { promisify } from "node:util";
 
@@ -207,6 +209,47 @@ export async function sessionsToday(since: number): Promise<Session[]> {
   return out.sort((a, b) => a.at - b.at);
 }
 
+// ---- digest -----------------------------------------------------------------
+
+const hhmmLocal = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+const lastTwo = (p: string) => p.split("/").slice(-2).join("/");
+const fmtBytes = (n: number) => n < 1024 ? `${n}B` : n < 1048576 ? `${(n / 1024) | 0}K` : `${(n / 1048576).toFixed(1)}M`;
+
+/**
+ * Write the day into the psi vault and return the path. ONE writer for both the
+ * headless verb and the TUI's `w` key, so the report cannot drift between paths —
+ * the drift-between-twins failure is this fleet's most repeated bug.
+ * The report states its window (label): a day written from a partial window says so.
+ */
+export function writeDigest(commits: Commit[], sessions: Session[], label: string, vaultDir?: string): string {
+  const root = dirname(dirname(realpathSync(fileURLToPath(import.meta.url))));
+  const psi = vaultDir ?? join(root, "psi");
+  if (!existsSync(psi)) throw new Error(vaultDir ? `no vault at ${psi}` : "no psi link beside the plugin — see CLAUDE.md");
+  // Day slug: "1-sep-tue-2026" — deliberately NOT ISO: these are for a human flipping
+  // through a folder; the ls-sorting trade is accepted. Shared builder — see daySlug().
+  const day = daySlug();
+  const dir = join(psi, "memory", "days");
+  mkdirSync(dir, { recursive: true });
+  const f = join(dir, `${day}.md`);
+  const repos = new Set(commits.map((c) => c.repo)).size;
+  const L: string[] = [];
+  L.push(`# ${day} — ${label}`, "");
+  L.push(`${commits.length} commits · ${repos} repos · ${sessions.length} sessions`, "");
+  L.push(`## Commits`, "");
+  let lastOrg = "";
+  for (const c of commits) {
+    const parts = c.repo.split("/");
+    const org = parts[parts.length - 2] ?? "";
+    if (org !== lastOrg) { L.push(`### ${org}`, ""); lastOrg = org; }
+    L.push(`- ${hhmmLocal(c.at)} \`${c.hash}\` ${parts[parts.length - 1]} — ${c.subject}`);
+  }
+  L.push("", `## Sessions`, "");
+  for (const s of sessions) L.push(`- ${hhmmLocal(s.at)} \`${s.id}\` ${lastTwo(s.project)} (${fmtBytes(s.bytes)})`);
+  L.push("", `_written by maw today digest, ${new Date().toISOString()}_`, "");
+  writeFileSync(f, L.join("\n"));
+  return f;
+}
+
 // ---- render -----------------------------------------------------------------
 
 const hhmm = (ms: number) =>
@@ -251,6 +294,25 @@ function render(label: string, commits: Commit[] | null, sessions: Session[] | n
 
 // ---- entry ------------------------------------------------------------------
 
+const since0 = (spec?: string) => resolveSince(spec).at;
+
+/** "+07" style offset tag, derived — hardcoding it would lie on every other machine. */
+export const tzTag = (d = new Date()) => {
+  const m = -d.getTimezoneOffset();
+  const sign = m >= 0 ? "+" : "-";
+  return `${sign}${String(Math.floor(Math.abs(m) / 60)).padStart(2, "0")}${Math.abs(m) % 60 ? ":" + String(Math.abs(m) % 60).padStart(2, "0") : ""}`;
+};
+
+/** "1sep-tue" — daymonth-weekday, lowercase, local TZ. Nat's format (2026-09-01,
+ *  revised same day from 1-sep-tue-2026). NOTE the accepted trade: without a year the
+ *  slug recurs when the same date falls on the same weekday again (~5-11 years), and a
+ *  day-repo of that name will already exist. Deliberate; flip by appending
+ *  `-${d.getFullYear()}` here if that day ever comes. */
+export function daySlug(d = new Date()): string {
+  return `${d.getDate()}${d.toLocaleString("en", { month: "short" }).toLowerCase()}-` +
+         d.toLocaleString("en", { weekday: "short" }).toLowerCase();
+}
+
 export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   const args = asArgs(ctx.args);
   const flag = (n: string) => {
@@ -274,8 +336,79 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
     return r.status === 0 ? { ok: true } : { ok: false, error: `tui exited ${r.status}` };
   }
 
+  // maw today repo — the day as a PRIVATE repo, created if missing, idempotent after.
+  // Shape proven by hand first (1-sep-tue-2026, 2026-09-01): /awaken vault skeleton,
+  // digest at ψ/memory/days/<slug>.md, gh repo create --private --source --push.
+  if (sub === "repo") {
+    const buf2: string[] = [];
+    const say = async (l: string) => { if (ctx.writer) await ctx.writer(l); else buf2.push(l); };
+    const slug = daySlug();
+    const org = process.env.MAW_TODAY_ORG || "nat-build-with-oracle";
+    let ghqRoot = "";
+    try { ghqRoot = (await run("ghq", ["root"])).stdout.trim(); }
+    catch { return { ok: false, error: "ghq not available — cannot place the day repo" }; }
+    const dir = join(ghqRoot, "github.com", org, slug);
+    const vault = join(dir, "ψ");
+
+    if (!existsSync(join(dir, "CLAUDE.md"))) {
+      await say(`▓ new day — scaffolding ${org}/${slug}`);
+      for (const d of ["inbox", "outbox", "writing", "lab", "archive",
+                       "memory/resonance", "memory/learnings", "memory/retrospectives",
+                       "memory/traces", "memory/days"])
+        mkdirSync(join(vault, d), { recursive: true });
+      for (const d of ["inbox", "outbox", "writing", "lab", "archive", "memory/resonance",
+                       "memory/learnings", "memory/retrospectives", "memory/traces"])
+        writeFileSync(join(vault, d, ".gitkeep"), "");
+      writeFileSync(join(dir, "CLAUDE.md"),
+        `# ${slug} — a day, kept\n\n` +
+        `> One day of the fleet, captured as a repo. Written by 'maw today repo'\n` +
+        `> (neo-oracle, ψ/lab/maw-today), born the same day it describes.\n\n` +
+        `A day capsule, not a project: the digest lives at ψ/memory/days/${slug}.md,\n` +
+        `and the /awaken-shaped vault holds whatever the day leaves behind — retros,\n` +
+        `learnings, traces, handoffs. Times are local (${tzTag()}).\n\n` +
+        `AI-generated per fleet Rule 6: assembled by an oracle, commissioned by Nat Weerawan.\n`);
+    } else {
+      await say(`▓ day repo exists — refreshing`);
+    }
+
+    await say(`▓ gathering the day…`);
+    const [commits, sessions] = await Promise.all([gitToday(since0(flag("since"))), sessionsToday(since0(flag("since")))]);
+    const f = writeDigest(commits, sessions, resolveSince(flag("since")).label, vault);
+    await say(`▓ ${commits.length} commits · ${sessions.length} sessions → ${f}`);
+
+    const git = (...a: string[]) => run("git", ["-C", dir, ...a]);
+    try { await git("rev-parse", "--git-dir"); } catch { await git("init", "-q"); }
+    await git("add", "-A");
+    const staged = await git("diff", "--cached", "--quiet").then(() => false).catch(() => true);
+    if (staged) {
+      await git("commit", "-q", "-m",
+        `day: ${slug} — ${commits.length} commits · ${sessions.length} sessions\n\n` +
+        `Written by maw today repo.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>`);
+      await say(`▓ committed`);
+    } else await say(`▓ nothing new to commit`);
+
+    const exists = await run("gh", ["repo", "view", `${org}/${slug}`, "--json", "name"]).then(() => true).catch(() => false);
+    if (!exists) {
+      // PRIVATE is load-bearing: the digest names private repos and their commit subjects.
+      await run("gh", ["repo", "create", `${org}/${slug}`, "--private", "--source", dir, "--push"]);
+      await say(`▓ created PRIVATE github.com/${org}/${slug} and pushed`);
+    } else if (staged) {
+      await git("push", "-u", "origin", "HEAD");
+      await say(`▓ pushed`);
+    }
+    return { ok: true, output: buf2.length ? buf2.join("\n") : undefined };
+  }
+
+  if (sub === "digest") {
+    const [commits, sessions] = await Promise.all([gitToday(since0(flag("since"))), sessionsToday(since0(flag("since")))]);
+    try {
+      const f = writeDigest(commits, sessions, resolveSince(flag("since")).label);
+      return { ok: true, output: `${commits.length} commits · ${sessions.length} sessions\ndigest → ${f}` };
+    } catch (e) { return { ok: false, error: String((e as Error).message) }; }
+  }
+
   if (!["all", "commits", "sessions"].includes(sub)) {
-    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, tui, or all` };
+    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, digest, repo, tui, or all` };
   }
 
   let since: { at: number; label: string };
@@ -306,7 +439,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   const buf: string[] = [];
   const emit = async (line = "") => { if (ctx.writer) await ctx.writer(line); else buf.push(line); };
 
-  await emit(`maw today — ${since.label}`);
+  await emit(`maw today — ${daySlug()}${since.label === "today" ? "" : ` · ${since.label}`} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })} +07`);
 
   let sessions: Session[] | null = null;
   if (wantSessions) {
