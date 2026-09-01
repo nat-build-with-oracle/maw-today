@@ -231,6 +231,12 @@ export function dayVaultDir(): string {
   return join(ghqRoot, "github.com", org, dayRepoSlug(), "ψ");
 }
 
+/** Human-readable gap: "6h33m" / "42m". */
+const fmtGap = (ms: number) => {
+  const m = Math.round(ms / 60000);
+  return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
+};
+
 export function writeDigest(commits: Commit[], sessions: Session[], label: string, vaultDir?: string): string {
   const psi = vaultDir ?? dayVaultDir();
   // Day slug: "1-sep-tue-2026" — deliberately NOT ISO: these are for a human flipping
@@ -242,15 +248,62 @@ export function writeDigest(commits: Commit[], sessions: Session[], label: strin
   const repos = new Set(commits.map((c) => c.repo)).size;
   const L: string[] = [];
   L.push(`# ${day} — ${label}`, "");
-  L.push(`${commits.length} commits · ${repos} repos · ${sessions.length} sessions`, "");
-  L.push(`## Commits`, "");
-  let lastOrg = "";
-  for (const c of commits) {
-    const parts = c.repo.split("/");
-    const org = parts[parts.length - 2] ?? "";
-    if (org !== lastOrg) { L.push(`### ${org}`, ""); lastOrg = org; }
-    L.push(`- ${hhmmLocal(c.at)} \`${c.hash}\` ${parts[parts.length - 1]} — ${c.subject}`);
+  // The window states itself, Huginn-style: a digest written at 17:10 must not read as
+  // the whole day. Everything below is DETERMINISTIC — counts and gaps computed from
+  // git/fs, no judgment. The narrative layer (why, retractions, friction) stays an
+  // oracle's job; code only refuses to fake it.
+  L.push(`window: ${label} · written ${hhmmLocal(Date.now())} ${tzTag()}`, "");
+  const projects = new Set(sessions.map((s) => s.project)).size;
+  L.push(`${commits.length} commits · ${repos} repos · ${sessions.length} sessions · ${projects} projects`, "");
+
+  if (commits.length) {
+    L.push(`## The day's shape`, "");
+    // Commits folded onto hour-of-day. For the default "today" window that IS the day;
+    // for --since 3d it is a fold and the window line above says so.
+    const perHour = new Array<number>(24).fill(0);
+    for (const c of commits) perHour[new Date(c.at).getHours()]++;
+    const SPARK = "▁▂▃▄▅▆▇█";
+    const peak = Math.max(...perHour);
+    const bars = perHour.map((n) => n === 0 ? "·" : SPARK[Math.min(7, Math.ceil((n / peak) * 8) - 1)]).join("");
+    // Ruler columns match bar columns: hour h sits at char h, so 06/12/18 land under
+    // their bars and 23 hugs the right edge.
+    L.push("```", `00    06    12    18  23`, bars,
+           `peak ${String(perHour.indexOf(peak)).padStart(2, "0")}:00 — ${peak} commit${peak === 1 ? "" : "s"}`);
+    // Droughts as stories: the longest silence between consecutive commits.
+    if (commits.length >= 2) {
+      let gap = 0, gi = 0;
+      for (let i = 1; i < commits.length; i++) {
+        const g = commits[i].at - commits[i - 1].at;
+        if (g > gap) { gap = g; gi = i; }
+      }
+      if (gap >= 45 * 60000)
+        L.push(`longest drought ${hhmmLocal(commits[gi - 1].at)} → ${hhmmLocal(commits[gi].at)} (${fmtGap(gap)})`);
+    }
+    L.push("```", "");
+
+    // WHO DID WHAT — authors from git %an, honestly labeled: co-author trailers are not
+    // captured (subject-only log), so "who" here is the committing author, no more.
+    L.push(`## Who did what`, "", "```");
+    const byAuthor = new Map<string, number>();
+    for (const c of commits) byAuthor.set(c.author, (byAuthor.get(c.author) ?? 0) + 1);
+    for (const [a, n] of [...byAuthor.entries()].sort((x, y) => y[1] - x[1]))
+      L.push(`${String(n).padStart(4)}  ${a}`);
+    L.push("```", "(authors from git %an — co-author trailers not counted)", "");
+    const byRepo = new Map<string, number>();
+    for (const c of commits) { const k = lastTwo(c.repo); byRepo.set(k, (byRepo.get(k) ?? 0) + 1); }
+    const top = [...byRepo.entries()].sort((x, y) => y[1] - x[1]).slice(0, 5);
+    L.push("```");
+    for (const [r, n] of top) L.push(`${String(n).padStart(4)}  ${r}`);
+    L.push("```", "");
   }
+
+  // Time-ordered feed, org inline. Org HEADERS were tried and produced repeats — the
+  // commits here are sorted by TIME (that is the day's story), so orgs interleave and
+  // a header-per-change fires constantly. The nested org view lives in `maw today
+  // commits`, which sorts by repo; this file reads chronologically, Huginn-style.
+  L.push(`## Commits`, "");
+  for (const c of commits)
+    L.push(`- ${hhmmLocal(c.at)} \`${c.hash}\` ${lastTwo(c.repo)} — ${c.subject}`);
   L.push("", `## Sessions`, "");
   for (const s of sessions) L.push(`- ${hhmmLocal(s.at)} \`${s.id}\` ${lastTwo(s.project)} (${fmtBytes(s.bytes)})`);
   L.push("", `_written by maw today digest, ${new Date().toISOString()}_`, "");
