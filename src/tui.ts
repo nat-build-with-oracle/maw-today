@@ -16,9 +16,46 @@
 import { spawnSync } from "node:child_process";
 import { gitToday, sessionsToday, resolveSince, writeDigest, daySlug, type Commit, type Session } from "./index.ts";
 
-if (!process.stdin.isTTY || !process.stdout.isTTY) {
-  console.error("maw today tui needs a real terminal (interactive tty) — pipes make a TUI deaf");
-  process.exit(1);
+// ---- terminal IO ------------------------------------------------------------
+// Run directly, stdin/stdout ARE the terminal. Run through maw, they are PIPES (that
+// is how the handler's writer streaming works) — so fall back to opening /dev/tty
+// ourselves. Note what does NOT work in Bun 1.3.14, probed before this was written:
+// passing tty fds through spawnSync stdio leaves process.stdout undefined in the
+// child, and `new tty.WriteStream(fd)` throws in its own fast path. What DOES work:
+// writeSync to a /dev/tty fd, tty.ReadStream(fd) for raw keys, `stty size` (with the
+// tty on ITS stdin) for dimensions, SIGWINCH to notice resizes.
+import { openSync, writeSync } from "node:fs";
+import tty from "node:tty";
+import { execFileSync } from "node:child_process";
+
+let IN: NodeJS.ReadStream;
+let out: (s: string) => void;
+let getSize: () => [number, number];
+
+if (process.stdin.isTTY && process.stdout?.isTTY) {
+  IN = process.stdin;
+  out = (x) => { process.stdout.write(x); };
+  getSize = () => [process.stdout.columns || 100, process.stdout.rows || 30];
+  process.stdout.on("resize", () => draw());
+} else {
+  let inFd: number, outFd: number;
+  try { inFd = openSync("/dev/tty", "r"); outFd = openSync("/dev/tty", "w"); }
+  catch {
+    console.error("maw today tui needs a real terminal (no /dev/tty) — pipes make a TUI deaf");
+    process.exit(1);
+  }
+  IN = new tty.ReadStream(inFd) as unknown as NodeJS.ReadStream;
+  out = (x) => { writeSync(outFd, x); };
+  const measure = (): [number, number] => {
+    try {
+      const [r, c] = execFileSync("stty", ["size"], { stdio: [openSync("/dev/tty", "r"), "pipe", "ignore"], encoding: "utf8" })
+        .trim().split(/\s+/).map(Number);
+      return [c || 100, r || 30];
+    } catch { return [100, 30]; }
+  };
+  let size = measure();
+  getSize = () => size;
+  process.on("SIGWINCH", () => { size = measure(); draw(); });
 }
 
 // ---- ansi -------------------------------------------------------------------
@@ -29,8 +66,8 @@ const A = {
   dim: `${ESC}2m`, bold: `${ESC}1m`, off: `${ESC}0m`, rev: `${ESC}7m`,
   cyan: `${ESC}36m`, grn: `${ESC}32m`, yel: `${ESC}33m`, mag: `${ESC}35m`,
 };
-const W = () => process.stdout.columns || 100;
-const H = () => process.stdout.rows || 30;
+const W = () => getSize()[0];
+const H = () => getSize()[1];
 
 // ---- display width ----------------------------------------------------------
 // Ported from m2/tui.mjs, verified 12/12 there on a mixed Thai/CJK/emoji/ZWJ table.
@@ -54,6 +91,31 @@ const cut = (s: string, n: number) => {
   return out;
 };
 const pad = (s: string, n: number) => { const t = cut(s, n); return t + " ".repeat(Math.max(0, n - wid(t))) };
+
+/**
+ * Clamp one RENDERED line to the terminal width, ANSI-aware. The plain cut() counts
+ * escape sequences as width-1 characters, so it cannot be used on coloured lines.
+ * WHY THIS EXISTS: any line one column too wide WRAPS, the whole frame shifts down a
+ * row, and the header scrolls off the top of the alt screen — observed live on the
+ * footer, whose key list was longer than the terminal was wide. Every line passes
+ * through here before the frame is written; a too-long line degrades to truncation,
+ * never to a wrap.
+ */
+function clampLine(line: string, width: number): string {
+  let out = "", w = 0, i = 0;
+  const chars = [...line];
+  while (i < chars.length) {
+    if (chars[i] === "\x1b") {                       // copy a full escape sequence, zero width
+      let j = i + 1;
+      if (chars[j] === "[") { j++; while (j < chars.length && !/[a-zA-Z]/.test(chars[j])) j++; j++; }
+      out += chars.slice(i, j).join(""); i = j; continue;
+    }
+    const cw = colWidth(chars[i]);
+    if (w + cw > width) break;
+    out += chars[i]; w += cw; i++;
+  }
+  return i < chars.length ? out + A.off : out;       // never leave colour bleeding past a cut
+}
 
 // ---- state ------------------------------------------------------------------
 type Row = { at: number; kind: "commit" | "session"; a: string; b: string; c: string; path?: string };
@@ -130,7 +192,8 @@ function draw() {
   lines.push(S.pick
     ? ` ${A.rev} ${short(S.pick.path!)} ${A.off}  ${A.yel}[w]${A.off} maw work — open/create workspace · ${A.yel}[a]${A.off} maw a — attach inside · ${A.dim}[esc] cancel${A.off}`
     : ` ${note}${A.dim}a all · c commits · s sessions · j/k move · ⏎ act on repo · r refresh · +/- window · w digest · q quit${A.off}`);
-  process.stdout.write(A.clear + lines.slice(0, H()).join("\n"));
+  // Clamp EVERY line: one wrap anywhere shifts the whole frame and loses the header.
+  out(A.clear + lines.slice(0, H()).map((l) => clampLine(l, W())).join("\n"));
 }
 
 // ---- data -------------------------------------------------------------------
@@ -180,16 +243,17 @@ function writeDigestNote(): string {
 
 // ---- lifecycle --------------------------------------------------------------
 // Last-resort restore: a crash must never leave a blank alt-screen with no cursor.
-const restore = () => { try { process.stdout.write(A.altOff) } catch {} };
+const restore = () => { try { out(A.altOff) } catch {} };
 process.on("exit", restore);
 process.on("uncaughtException", (e) => { restore(); console.error(e); process.exit(1); });
 process.on("SIGINT", () => process.exit(0));
 
-process.stdout.write(A.altOn);
-process.stdin.setRawMode(true);
-process.stdin.resume();
-process.stdin.setEncoding("utf8");
-process.stdout.on("resize", draw);
+out(A.altOn);
+IN.setRawMode!(true);
+IN.resume();
+IN.setEncoding("utf8");
+// resize handling lives in the terminal-IO section: process.stdout "resize" when the
+// process streams are the tty, SIGWINCH + stty when /dev/tty was opened by hand.
 
 /** maw sessions are named after the oracle, so kvmbox-oracle attaches as `maw a kvmbox`. */
 const attachName = (path: string) => path.split("/").pop()!.replace(/-oracle$/, "");
@@ -197,13 +261,13 @@ const attachName = (path: string) => path.split("/").pop()!.replace(/-oracle$/, 
 function act(cmd: "work" | "a", path: string) {
   restore();
   const arg = cmd === "a" ? attachName(path) : path;
-  process.stdout.write(`\n→ maw ${cmd} ${arg}\n`);
+  out(`\n→ maw ${cmd} ${arg}\n`);
   const r = spawnSync("maw", [cmd, arg], { stdio: "inherit" });
-  if (r.status !== 0) process.stdout.write(`maw ${cmd} exited ${r.status} — cd ${path}\n`);
+  if (r.status !== 0) out(`maw ${cmd} exited ${r.status} — cd ${path}\n`);
   process.exit(r.status === 0 ? 0 : 1);
 }
 
-process.stdin.on("data", (key: string) => {
+IN.on("data", (key: string) => {
   S.note = "";
   // An armed prompt captures the keyboard until answered — the same keys mean
   // different things there, and leaking "w" through to the digest writer would be
