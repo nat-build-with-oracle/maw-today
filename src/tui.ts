@@ -118,11 +118,12 @@ function clampLine(line: string, width: number): string {
 }
 
 // ---- state ------------------------------------------------------------------
-type Row = { at: number; kind: "commit" | "session"; a: string; b: string; c: string; path?: string };
+type Row = { at: number; kind: "commit" | "session"; a: string; b: string; c: string; path?: string; typed?: boolean; d?: string };
 
 const S = {
   view: "all" as "all" | "commits" | "sessions",
   sinceSpec: undefined as string | undefined,   // undefined = local midnight
+  sinceAt: 0,                   // resolved window start — the typed/background boundary
   label: "today",
   commits: [] as Commit[],
   sessions: [] as Session[],
@@ -144,7 +145,13 @@ function rows(): Row[] {
   if (S.view !== "sessions")
     for (const c of S.commits) out.push({ at: c.at, kind: "commit", a: c.hash, b: short(c.repo), c: c.subject, path: c.repo });
   if (S.view !== "commits")
-    for (const s of S.sessions) out.push({ at: s.at, kind: "session", a: s.id, b: short(s.project), c: bytes(s.bytes) });
+    for (const s of S.sessions) out.push({
+      at: s.at, kind: "session", a: s.id, b: short(s.project), c: bytes(s.bytes),
+      // typed: real keyboard input inside the window (see index.ts Session.typedAt —
+      // mtime is a liar's metric). undefined = split unavailable, render plain.
+      typed: s.typedAt === undefined ? undefined : (s.typedAt ?? 0) >= S.sinceAt,
+      d: s.typedAt ? hhmm(s.typedAt) : undefined,
+    });
   return out.sort((x, y) => x.at - y.at);
 }
 
@@ -153,7 +160,9 @@ function draw() {
   const lines: string[] = [];
   const repoN = new Set(S.commits.map((c) => c.repo)).size;
   const projN = new Set(S.sessions.map((s) => s.project)).size;
-  const left = ` ${A.bold}maw today${A.off} ${A.yel}${daySlug()}${A.off} ${A.dim}${S.label}${A.off}  ${A.grn}${S.commits.length}${A.off} commits/${repoN}  ${A.cyan}${S.sessions.length}${A.off} sessions/${projN}`;
+  const split = S.sessions.length > 0 && S.sessions.every((s) => s.typedAt !== undefined);
+  const typedN = split ? S.sessions.filter((s) => (s.typedAt ?? 0) >= S.sinceAt).length : 0;
+  const left = ` ${A.bold}maw today${A.off} ${A.yel}${daySlug()}${A.off} ${A.dim}${S.label}${A.off}  ${A.grn}${S.commits.length}${A.off} commits/${repoN}  ${A.cyan}${split ? `${typedN}👤/` : ""}${S.sessions.length}${A.off} sessions/${projN}`;
   const right = S.loading ? `${A.yel}loading…${A.off} ` : `${A.dim}${hhmm(S.loadedAt)}${A.off} `;
   const leftW = wid(left.replace(/\x1b\[[0-9;]*m/g, ""));
   const rightW = wid(right.replace(/\x1b\[[0-9;]*m/g, ""));
@@ -178,10 +187,15 @@ function draw() {
     for (let i = 0; i < slice.length; i++) {
       const row = slice[i];
       const sel = S.scroll + i === S.cur;
-      const tag = row.kind === "commit" ? `${A.grn}▮${A.off}` : `${A.cyan}▯${A.off}`;
+      // Background sessions (typed === false) dim their tag: the file moved, nobody
+      // typed — a listener, agent, or heartbeat. typed === undefined renders plain.
+      const tag = row.kind === "commit" ? `${A.grn}▮${A.off}`
+        : row.typed === false ? `${A.dim}▯${A.off}` : `${A.cyan}▯${A.off}`;
       const body = row.kind === "commit"
         ? `${A.yel}${row.a}${A.off} ${pad(row.b, 26)} ${cut(row.c, Math.max(10, W() - 48))}`
-        : `${A.mag}${row.a}${A.off} ${pad(row.b, 26)} ${A.dim}${row.c}${A.off}`;
+        : `${A.mag}${row.a}${A.off} ${pad(row.b, 26)} ${A.dim}${row.c}${A.off}` +
+          (row.typed === true ? `  👤${row.d ? ` ${A.dim}${row.d}${A.off}` : ""}`
+           : row.typed === false ? `  ${A.dim}bg${A.off}` : "");
       lines.push(`${sel ? A.rev + ">" : " "}${hhmm(row.at)} ${tag} ${body}${sel ? A.off : ""}`);
     }
   }
@@ -200,7 +214,7 @@ function draw() {
 async function load() {
   S.loading = true; S.boot = []; draw();
   const since = resolveSince(S.sinceSpec);
-  S.label = since.label;
+  S.label = since.label; S.sinceAt = since.at;
   const say = (l: string) => { S.boot.push(l); draw(); };
   say(` ${A.grn}▓${A.off} scanning ghq tree…`);
   let checked = 0, total = 0;
