@@ -136,7 +136,7 @@ async function candidates(repos: string[], since: number): Promise<string[]> {
   return hits;
 }
 
-async function commitsIn(repo: string, since: number): Promise<Commit[]> {
+async function commitsIn(repo: string, since: number, strict = false): Promise<Commit[]> {
   try {
     // %x1f is a unit separator: subjects contain every other delimiter you might pick.
     const { stdout } = await run(
@@ -149,7 +149,8 @@ async function commitsIn(repo: string, since: number): Promise<Commit[]> {
       const [hash, at, author, subject] = line.split("\x1f");
       return { repo, hash: hash.slice(0, 7), at: Number(at) * 1000, author, subject };
     });
-  } catch {
+  } catch (e) {
+    if (strict) throw e;
     return [];
   }
 }
@@ -162,6 +163,7 @@ export async function gitToday(
   since: number,
   onRepo?: (repo: string, commits: Commit[]) => void | Promise<void>,
   onScan?: (repoCount: number, candidateCount: number) => void | Promise<void>,
+  strict = false,
 ): Promise<Commit[]> {
   const repos = await ghqRepos();
   const cand = await candidates(repos, since);
@@ -170,7 +172,7 @@ export async function gitToday(
   const CHUNK = 16; // process spawns, not stats — keep this small
   for (let i = 0; i < cand.length; i += CHUNK) {
     const slice = cand.slice(i, i + CHUNK);
-    const batch = await Promise.all(slice.map((r) => commitsIn(r, since)));
+    const batch = await Promise.all(slice.map((r) => commitsIn(r, since, strict)));
     for (let j = 0; j < batch.length; j++) {
       await onRepo?.(slice[j], batch[j]);   // fires on zero commits too — a check is an event
       out.push(...batch[j]);
@@ -596,7 +598,7 @@ async function syncDayRepo(
   // milliseconds apart, and "the same window" should be literally the same number.
   const winAt = since0(sinceSpec);
   const [commits, sessions, gh] = await Promise.all([
-    gitToday(winAt), sessionsToday(winAt),
+    gitToday(winAt, undefined, undefined, localOnly), sessionsToday(winAt),
     ghToday(winAt).catch(() => null),   // null = unreachable; digest says so
   ]);
   gathered?.(gh, commits, sessions);
@@ -719,6 +721,32 @@ export async function prepareFleet(dir: string, fleetDir: string, dryRun: boolea
   }
 }
 
+export async function sweepOracle(repo: string, execute = run) {
+  const warnings: string[] = [], blockingErrors: string[] = [];
+  const result = { repo, status: "", verify: "", statusCheck: "unknown", verifyCheck: "unknown", warnings, blockingErrors };
+  const cwd = join(repo, "ψ/teams");
+  let recipes: Set<string>;
+  try { recipes = new Set(String((await execute("just", ["--summary"], { cwd, timeout: 30000 })).stdout).trim().split(/\s+/)); }
+  catch (e: any) { blockingErrors.push(`${repo}: just --summary: ${e.message}`); return result; }
+  for (const verb of ["status", "verify"] as const) {
+    const check = verb === "status" ? "statusCheck" : "verifyCheck";
+    if (!recipes.has(verb)) {
+      result[check] = `${verb}: n/a (no recipe)`;
+      warnings.push(`${repo}: ${result[check]}`);
+      continue;
+    }
+    try {
+      result[verb] = String((await execute("just", [verb], { cwd, timeout: 30000, maxBuffer: 4 << 20 })).stdout);
+      result[check] = `${verb}: ok`;
+    } catch (e: any) {
+      result[check] = `${verb}: failed`;
+      blockingErrors.push(`${repo}: just ${verb}: ${e.message}`);
+      result[verb] = String(e.stdout || "");
+    }
+  }
+  return result;
+}
+
 async function wrapup(dryRun: boolean, json: boolean): Promise<InvokeResult> {
   try {
     const root = (await run("ghq", ["root"])).stdout.trim();
@@ -731,18 +759,17 @@ async function wrapup(dryRun: boolean, json: boolean): Promise<InvokeResult> {
     if (!refreshed.ok) return refreshed;
     const fleetDir = join(dir, "ψ/memory/fleet");
     const { wakePlan, snapshot } = await prepareFleet(dir, fleetDir, dryRun);
-    const rows: WorkerRow[] = [], warnings: string[] = [], charters: string[] = [];
+    const rows: WorkerRow[] = [], warnings: string[] = [], blockingErrors: string[] = [], charters: string[] = [];
     const repos = (await run("ghq", ["list", "-p"])).stdout.trim().split("\n").filter(Boolean);
-    const sweep: { repo: string; status: string; verify: string }[] = [];
+    const sweep: Awaited<ReturnType<typeof sweepOracle>>[] = [];
     for (const repo of repos) {
       const teams = join(repo, "ψ/teams");
       if (!existsSync(join(teams, "justfile"))) continue;
-      const collect = async (verb: string) => {
-        try { return (await run("just", [verb], { cwd: teams, timeout: 30000, maxBuffer: 4 << 20 })).stdout; }
-        catch (e: any) { warnings.push(`${repo}: just ${verb}: ${e.message}`); return String(e.stdout || ""); }
-      };
-      const status = await collect("status"), verify = await collect("verify");
-      sweep.push({ repo, status, verify });
+      const result = await sweepOracle(repo);
+      sweep.push(result);
+      warnings.push(...result.warnings);
+      blockingErrors.push(...result.blockingErrors);
+      const { status, verify } = result;
       const local = parseWorkers(repo.slice(root.length + 1), status, verify);
       for (const row of local) {
         const panes = snapshot.sessions.flatMap((s: any) => s.panes).filter((p: any) =>
@@ -761,10 +788,12 @@ async function wrapup(dryRun: boolean, json: boolean): Promise<InvokeResult> {
       }
       rows.push(...local);
     }
-    const table = workersTable(rows);
+    if (!sweep.length) blockingErrors.push("Zero oracles swept");
+    const oracleTable = ["| oracle | status | verify |", "|---|---|---|", ...sweep.map(s => `| ${cell(s.repo)} | ${s.statusCheck} | ${s.verifyCheck} |`)].join("\n");
+    const table = workersTable(rows) + "\n\n### Oracle recipe coverage\n" + oracleTable;
     appendFileSync(wakePlan, `\n## Workers\n\n${table}\n\n${warnings.map(w => `- ${cell(w)}`).join("\n")}\n`);
     const gh = github as GhDay | null;
-    if (!gh) warnings.push("GitHub unavailable: issue list unknown; do not post comments.");
+    if (!gh) blockingErrors.push("GitHub unavailable: issue list unknown; do not post comments.");
     if (gh?.truncated) warnings.push("GitHub results truncated: issue list incomplete; reconcile before commenting.");
     const issues = gh?.items.filter(g => g.kind === "issue-opened") ?? [];
     const prs = gh?.items.filter(g => g.kind === "pr-opened") ?? [];
@@ -779,17 +808,17 @@ async function wrapup(dryRun: boolean, json: boolean): Promise<InvokeResult> {
     })));
     writeFileSync(prompt, buildWrapupBundle({ now: new Date(), dir, slug: daySlug(), wakePlan,
       dryRun, signature: `[${lead?.name ?? "unknown"}:${oracle}]`,
-      digest: readFileSync(digest, "utf8"), table, charters, warnings,
+      digest: readFileSync(digest, "utf8"), table, charters, warnings, blockingErrors,
       commits: dayCommits, sessions: daySessions, issues, prs, rows, sessionClocks, sweptCount: sweep.length,
     }));
     if (!dryRun) {
-      if (warnings.length) throw new Error(`Gathering incomplete; no publication: ${warnings.join("; ")}. Prompt: ${prompt}`);
+      if (blockingErrors.length) throw new Error(`Gathering incomplete; no publication: ${blockingErrors.join("; ")}. Prompt: ${prompt}`);
       const tomorrow = await handler({ args: ["tomorrow"] });
       if (!tomorrow.ok) return tomorrow;
       await commitPushDay(dir, org, dayRepoSlug(), `day: ${daySlug()} — wrapup`, async () => {});
     }
     const afterReboot = [`cd ${dir}`, `cat ${wakePlan}`, "Say I'm back → /maw-wake"];
-    return { ok: true, output: json ? JSON.stringify({ dryRun, dayRepo: dir, wakePlan, prompt, rows, warnings, sweptRepos: sweep.map(s => s.repo), afterReboot }, null, 2)
+    return { ok: true, output: json ? JSON.stringify({ dryRun, dayRepo: dir, wakePlan, prompt, rows, warnings, blockingErrors, oracleResults: sweep.map(({ repo, statusCheck, verifyCheck }) => ({ repo, statusCheck, verifyCheck })), sweptRepos: sweep.map(s => s.repo), afterReboot }, null, 2)
       : `${dryRun ? "DRY RUN — no commit/push/tomorrow" : "Wrapup complete"}\n${table}\nprompt: ${prompt}\n${afterReboot.join("\n")}` };
   } catch (e) { return { ok: false, error: String((e as Error).message) }; }
 }

@@ -60,3 +60,32 @@ test("two dry snapshots overwrite stable artifacts and preserve real history", a
     expect(readFileSync(join(fleet, "dry-run_fleet.md"), "utf8")).toBe(`snapshot ${join(fleet, "dry-run_fleet.json")}`);
   } finally { rmSync(fleet, { recursive: true, force: true }); }
 });
+
+import { sweepOracle } from "./index";
+test("missing recipes warn without executing or blocking", async () => {
+  const calls: string[] = [];
+  const fake = async (_: string, args: string[]) => {
+    calls.push(args[0]);
+    return { stdout: args[0] === "--summary" ? "status up" : "", stderr: "" };
+  };
+  const result = await sweepOracle("/repo", fake as any);
+  expect(calls).toEqual(["--summary", "status"]);
+  expect(result.verifyCheck).toBe("verify: n/a (no recipe)");
+  expect(result.warnings).toHaveLength(1);
+  expect(result.blockingErrors).toEqual([]);
+});
+test("existing recipe failures block rather than becoming n/a", async () => {
+  const fake = async (_: string, args: string[]) => {
+    if (args[0] === "--summary") return { stdout: "status verify", stderr: "" };
+    throw new Error("recipe exited 1");
+  };
+  const result = await sweepOracle("/repo", fake as any);
+  expect(result.blockingErrors).toHaveLength(2);
+  expect(result.statusCheck).toBe("status: failed");
+  expect(result.warnings).toEqual([]);
+});
+test("missing status and verify produces only two warnings", async () => {
+  const result = await sweepOracle("/repo", (async () => ({ stdout: "up", stderr: "" })) as any);
+  expect(result.warnings).toHaveLength(2);
+  expect(result.blockingErrors).toEqual([]);
+});
