@@ -1,3 +1,4 @@
+import { sessionInventory, renderSessions } from "./session-chain";
 import { buildWrapupBundle } from "./wrapup-bundle";
 // maw today — what happened on this machine today.
 //
@@ -759,6 +760,9 @@ async function wrapup(dryRun: boolean, json: boolean): Promise<InvokeResult> {
     if (!refreshed.ok) return refreshed;
     const fleetDir = join(dir, "ψ/memory/fleet");
     const { wakePlan, snapshot } = await prepareFleet(dir, fleetDir, dryRun);
+    const sessions = await sessionInventory(join(homedir(), ".claude/projects"), join(homedir(), ".codex/sessions"), since0(), Date.now(), snapshot);
+    const sessionsMarkdown = renderSessions(sessions);
+    appendFileSync(wakePlan, `\n${sessionsMarkdown}\n`);
     const rows: WorkerRow[] = [], warnings: string[] = [], blockingErrors: string[] = [], charters: string[] = [];
     const repos = (await run("ghq", ["list", "-p"])).stdout.trim().split("\n").filter(Boolean);
     const sweep: Awaited<ReturnType<typeof sweepOracle>>[] = [];
@@ -809,7 +813,7 @@ async function wrapup(dryRun: boolean, json: boolean): Promise<InvokeResult> {
     writeFileSync(prompt, buildWrapupBundle({ now: new Date(), dir, slug: daySlug(), wakePlan,
       dryRun, signature: `[${lead?.name ?? "unknown"}:${oracle}]`,
       digest: readFileSync(digest, "utf8"), table, charters, warnings, blockingErrors,
-      commits: dayCommits, sessions: daySessions, issues, prs, rows, sessionClocks, sweptCount: sweep.length,
+      commits: dayCommits, sessions: daySessions, sessionInventory: sessions, sessionsMarkdown, issues, prs, rows, sessionClocks, sweptCount: sweep.length,
     }));
     if (!dryRun) {
       if (blockingErrors.length) throw new Error(`Gathering incomplete; no publication: ${blockingErrors.join("; ")}. Prompt: ${prompt}`);
@@ -818,7 +822,7 @@ async function wrapup(dryRun: boolean, json: boolean): Promise<InvokeResult> {
       await commitPushDay(dir, org, dayRepoSlug(), `day: ${daySlug()} — wrapup`, async () => {});
     }
     const afterReboot = [`cd ${dir}`, `cat ${wakePlan}`, "Say I'm back → /maw-wake"];
-    return { ok: true, output: json ? JSON.stringify({ dryRun, dayRepo: dir, wakePlan, prompt, rows, warnings, blockingErrors, oracleResults: sweep.map(({ repo, statusCheck, verifyCheck }) => ({ repo, statusCheck, verifyCheck })), sweptRepos: sweep.map(s => s.repo), afterReboot }, null, 2)
+    return { ok: true, output: json ? JSON.stringify({ dryRun, dayRepo: dir, wakePlan, prompt, rows, sessions, warnings, blockingErrors, oracleResults: sweep.map(({ repo, statusCheck, verifyCheck }) => ({ repo, statusCheck, verifyCheck })), sweptRepos: sweep.map(s => s.repo), afterReboot }, null, 2)
       : `${dryRun ? "DRY RUN — no commit/push/tomorrow" : "Wrapup complete"}\n${table}\nprompt: ${prompt}\n${afterReboot.join("\n")}` };
   } catch (e) { return { ok: false, error: String((e as Error).message) }; }
 }
