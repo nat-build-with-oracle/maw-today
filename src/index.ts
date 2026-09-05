@@ -33,8 +33,8 @@ import { buildWrapupBundle } from "./wrapup-bundle";
 
 import { execFile } from "node:child_process";
 import { stat, readdir } from "node:fs/promises";
-import { mkdirSync, writeFileSync, existsSync, realpathSync, readFileSync, appendFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, writeFileSync, existsSync, realpathSync, readFileSync, appendFileSync, mkdtempSync, rmSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { promisify } from "node:util";
@@ -687,6 +687,38 @@ export function workersTable(rows: WorkerRow[]): string {
     ...rows.map(r => `| ${[r.oracle, r.worker, r.body, r.state, r.contextLeft, r.ahead, r.cwdCheck, r.lastLine].map(cell).join(" | ")} |`)].join("\n");
 }
 
+export function charterBullets(readme: string): string[] {
+  const section = /^## Charter-lite\s*\r?\n([\s\S]*?)(?=^##? |$(?![\s\S]))/m.exec(readme)?.[1] ?? "";
+  return section.split("\n").filter(l => /^- \*\*(Done-when|Escalate)\*\*:/.test(l));
+}
+
+export async function prepareFleet(dir: string, fleetDir: string, dryRun: boolean, execute = run) {
+  mkdirSync(fleetDir, { recursive: true });
+  // The upstream writer always stamps and updates latest/INDEX. Isolate dry runs,
+  // publish only four stable filenames, and leave real-run history untouched.
+  const destination = dryRun ? mkdtempSync(join(fleetDir, ".dry-run-")) : fleetDir;
+  try {
+    const prep = await execute("python3", [join(homedir(), ".claude/skills/maw-teams/scripts/maw_teams.py"), "--restart-prep"],
+      { cwd: dir, env: { ...process.env, MAW_SNAPSHOT_DIR: destination, MAW_SNAPSHOT_KEEP: "1000000" }, maxBuffer: 16 << 20 });
+    const reported = /^wake plan:\s*(.+)$/m.exec(String(prep.stdout))?.[1].trim();
+    if (!reported || dirname(reported) !== destination) throw new Error("restart-prep did not report a day-local wake plan");
+    const snapshotText = readFileSync(join(destination, "latest.json"), "utf8");
+    const snapshot = JSON.parse(snapshotText);
+    if (!dryRun) return { wakePlan: reported, snapshot };
+    const sourceJSON = join(destination, basename(realpathSync(join(destination, "latest.json"))));
+    const wakePlan = join(fleetDir, "dry-run_wake-plan.md");
+    const rewrite = (text: string) => text.split(sourceJSON).join(join(fleetDir, "dry-run_fleet.json"))
+      .split(sourceJSON.replace(/\.json$/, ".md")).join(join(fleetDir, "dry-run_fleet.md"))
+      .split(reported).join(wakePlan);
+    writeFileSync(join(fleetDir, "dry-run_fleet.json"), snapshotText);
+    writeFileSync(join(fleetDir, "dry-run_fleet.md"), rewrite(readFileSync(sourceJSON.replace(/\.json$/, ".md"), "utf8")));
+    writeFileSync(wakePlan, rewrite(readFileSync(reported, "utf8")));
+    return { wakePlan, snapshot };
+  } finally {
+    if (dryRun) rmSync(destination, { recursive: true, force: true });
+  }
+}
+
 async function wrapup(dryRun: boolean, json: boolean): Promise<InvokeResult> {
   try {
     const root = (await run("ghq", ["root"])).stdout.trim();
@@ -698,12 +730,7 @@ async function wrapup(dryRun: boolean, json: boolean): Promise<InvokeResult> {
     const refreshed = await syncDayRepo({}, "repo", undefined, true, (g, c, s) => { github = g; dayCommits = c; daySessions = s; });
     if (!refreshed.ok) return refreshed;
     const fleetDir = join(dir, "ψ/memory/fleet");
-    const prep = await run("python3", [join(homedir(), ".claude/skills/maw-teams/scripts/maw_teams.py"), "--restart-prep"],
-      { cwd: dir, env: { ...process.env, MAW_SNAPSHOT_DIR: fleetDir, MAW_SNAPSHOT_KEEP: "1000000" }, maxBuffer: 16 << 20 });
-    // Use the path reported by this invocation, not a possibly stale newest file.
-    const wakePlan = /^wake plan:\s*(.+)$/m.exec(prep.stdout)?.[1].trim();
-    if (!wakePlan || dirname(wakePlan) !== fleetDir) throw new Error("restart-prep did not report a day-local wake plan");
-    const snapshot = JSON.parse(readFileSync(join(fleetDir, "latest.json"), "utf8"));
+    const { wakePlan, snapshot } = await prepareFleet(dir, fleetDir, dryRun);
     const rows: WorkerRow[] = [], warnings: string[] = [], charters: string[] = [];
     const repos = (await run("ghq", ["list", "-p"])).stdout.trim().split("\n").filter(Boolean);
     const sweep: { repo: string; status: string; verify: string }[] = [];
@@ -728,7 +755,7 @@ async function wrapup(dryRun: boolean, json: boolean): Promise<InvokeResult> {
         }
         const readme = join(repo, "ψ/lab", row.worker, "README.md");
         if (existsSync(readme)) {
-          const lines = readFileSync(readme, "utf8").split("\n").filter(l => /^- \*\*(Done-when|Escalate)\*\*:/.test(l));
+          const lines = charterBullets(readFileSync(readme, "utf8"));
           charters.push(`### ${row.oracle} / ${row.worker}\nSource: ${readme}\n${lines.join("\n") || "Charter lines missing — escalate."}`);
         }
       }

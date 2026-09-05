@@ -8,13 +8,12 @@ const fixture = () => buildWrapupBundle({
   commits: [{ repo: "repo-one", hash: "abc1234", at: 1788610000000, subject: "real change", author: "a" }],
   sessions: [], issues: [], prs: [], rows: [], sessionClocks: [{ session_start: "observed-start" }], sweptCount: 15,
 });
-test("four standalone jobs repeat evidence, gates, and exact footer", () => {
+test("four jobs reference one shared evidence section and retain gates/footer", () => {
   const sections = fixture().split(/^## Prompt: /m).slice(1);
   expect(sections).toHaveLength(4);
   for (const section of sections) {
     expect(section).toContain("DRY RUN. Read/inspect only");
-    expect(section).toContain("observed-start");
-    expect(section).toContain("abc1234");
+    expect(section).toContain("evidence: see Shared evidence above");
     expect(section).toContain("Output:");
     expect(section.trim()).toEndWith("Write the file, commit only that path, push.\nNever touch a live pane.\nSign [22-5sep-sat2026:5sep-sat2026].");
   }
@@ -34,4 +33,11 @@ test("short book has outline, committed sources, PDF and explicit issue 180", ()
   expect(b).toContain("6sep-sun-wrapup.pdf");
   expect(b).toContain('"number": 180');
   expect(b).toContain("repo-one");
+});
+
+test("shared digest and normalized evidence appear exactly once", () => {
+  const b = fixture();
+  expect(b.match(/^## Shared evidence$/gm)).toHaveLength(1);
+  expect(b.match(/digest ``` evidence/g)).toHaveLength(1);
+  expect(b.match(/observed-start/g)).toHaveLength(1);
 });
