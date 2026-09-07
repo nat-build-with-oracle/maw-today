@@ -9,7 +9,7 @@ import { buildWrapupBundle } from "./wrapup-bundle";
 //   maw today --since 3d           widen the window (1d | 3d | 2h | YYYY-MM-DD)
 //   maw today --json               machine-readable
 //   maw today tomorrow             pre-birth tomorrow's day repo
-//   maw today idea <title>         birth an idea capsule — PRIVATE repo idea-7sep-<slug>, linked from today
+//   maw today idea <title>         birth an idea capsule — PRIVATE repo idea-7sep-mon2026-<slug>, linked from today
 //
 // ┌──────────────────────────────────────────────────────────────────────────┐
 // │  WHY THE PREFILTER EXISTS — this is the whole design.                    │
@@ -575,12 +575,12 @@ export function ideaSlug(title: string): string {
     .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48).replace(/-+$/, "");
 }
 
-/** The idea's REPO name — "idea-7sep-<slug>" (Nat, 2026-09-07). Day-month without
- *  weekday or year: the name is for the thought, the date only says when it struck. The
- *  accepted trade is the same as daySlug's — a same-slug idea on the same day-of-year in
- *  a later year collides; `already born` says so instead of overwriting. */
+/** The idea's REPO name — "idea-7sep-mon2026-<slug>" (Nat, 2026-09-07, revised the same
+ *  morning from idea-7sep-<slug>): the date part is EXACTLY the day repo's
+ *  (7sep-mon2026-oracle minus -oracle), so an idea sorts next to its day in the org and
+ *  the year keeps names from colliding across years, as dayRepoSlug's does. */
 export function ideaRepoSlug(slug: string, d = new Date()): string {
-  return `idea-${d.getDate()}${d.toLocaleString("en", { month: "short" }).toLowerCase()}-${slug}`;
+  return `idea-${daySlug(d)}${d.getFullYear()}-${slug}`;
 }
 
 /**
@@ -953,7 +953,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
     return { ok: true, output: buf2.length ? buf2.join("\n") : undefined };
   }
 
-  // IDEA — an idea capsule born from today (Nat, 2026-09-07: "idea-7sep-xxxxx"). The
+  // IDEA — an idea capsule born from today (Nat, 2026-09-07: "idea-7sep-mon2026-xxxxx"). The
   // SAME birth as a day: the /awaken vault, a PRIVATE repo under the org, commit + push
   // on first contact — but named for the thought, not the date, and linked BOTH ways:
   // the idea's CLAUDE.md names the day it came from, and the day's ψ/outbox/ideas/<slug>.md
@@ -986,7 +986,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
       return { ok: true, output: `${org}/${repoSlug} already born — ${dir}` };
     const dayRepo = dayRepoSlug(), dayFile = daySlug();
     const dayDir = join(ghqRoot, "github.com", org, dayRepo);
-    const born = `${hhmmLocal(Date.now())} ${tzTag()} ${dayFile}`;
+    const born = `${hhmmLocal(Date.now())} ${tzTag()}`;
 
     await say(`▓ idea — ${org}/${repoSlug}`);
     scaffoldIdea(dir, repoSlug, title, born, `${org}/${dayRepo}`);
