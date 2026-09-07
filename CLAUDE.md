@@ -114,5 +114,6 @@ Each DAY REPO (nat-build-with-oracle/<slug>) carries the real vault:
 
 Each IDEA REPO (nat-build-with-oracle/idea-7sep-mon2026-<slug>, Nat 2026-09-07) is the same
 /awaken skeleton with its own CLAUDE.md + README naming the day it came from — the
-two-way link at birth. Not yet a project; /incubate or /awaken it from there if it grows.
+two-way link at birth — and a PROPOSAL.md (idea · why now · what it would take · done
+when; status: draft). Not yet a project; /incubate or /awaken it from there if it grows.
 ```

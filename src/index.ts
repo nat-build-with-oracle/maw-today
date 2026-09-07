@@ -657,18 +657,34 @@ function scaffoldVault(vault: string, extra: string[] = []) {
   for (const d of VAULT_DIRS) writeFileSync(join(vault, d, ".gitkeep"), "");
 }
 
-/** The idea capsule: the shared vault skeleton, its own CLAUDE.md, and a README — the
- *  README is what github.com shows when browsing the org, so the title must be there. */
+/** The proposal an idea is born with (Nat, 2026-09-07: "create proposal"). A template
+ *  with the title filled and every other section a question — the capsule's job is to
+ *  hold the answers as they come. `status: draft` until a human flips it; the code never
+ *  claims an idea is more decided than it is. */
+export function proposalMd(title: string, born: string, dayRepo: string): string {
+  return `# Proposal — ${title}\n\n` +
+    `born ${born} from ${dayRepo} · status: draft\n\n` +
+    `## The idea\n\n${title}\n\n_(one paragraph: what it is, in plain words)_\n\n` +
+    `## Why now\n\n_What today made this worth writing down._\n\n` +
+    `## What it would take\n\n- [ ] first concrete step\n- [ ] \n\n` +
+    `## Done when\n\n_The observable state that means this idea became real — or the reason it was let go._\n\n` +
+    `## Notes\n\n_Links, sketches, prior art. Raw material goes in ψ/inbox._\n`;
+}
+
+/** The idea capsule: the shared vault skeleton, its own CLAUDE.md, a README — what
+ *  github.com shows when browsing the org, so the title must be there — and PROPOSAL.md. */
 function scaffoldIdea(dir: string, repoSlug: string, title: string, born: string, dayRepo: string) {
   scaffoldVault(join(dir, "ψ"));
-  writeFileSync(join(dir, "README.md"), `# ${title}\n\nborn ${born} from ${dayRepo} · \`${repoSlug}\`\n`);
+  writeFileSync(join(dir, "README.md"), `# ${title}\n\nborn ${born} from ${dayRepo} · \`${repoSlug}\` · [proposal](PROPOSAL.md)\n`);
+  writeFileSync(join(dir, "PROPOSAL.md"), proposalMd(title, born, dayRepo));
   writeFileSync(join(dir, "CLAUDE.md"),
     `# ${repoSlug} — an idea, kept\n\n` +
     `> ${title}\n\n` +
     `Born ${born} from the day ${dayRepo}, by 'maw today idea'\n` +
     `(nat-build-with-oracle/maw-today).\n\n` +
-    `An idea capsule, not yet a project: the /awaken-shaped vault holds whatever the\n` +
-    `idea grows — notes in ψ/inbox, drafts in ψ/writing, experiments in ψ/lab. If it\n` +
+    `An idea capsule, not yet a project: PROPOSAL.md says what it is, why now, what it\n` +
+    `would take, and when it is done; the /awaken-shaped vault holds whatever the idea\n` +
+    `grows — notes in ψ/inbox, drafts in ψ/writing, experiments in ψ/lab. If it\n` +
     `becomes real, /incubate or /awaken it from here; if it never does, it stays as the\n` +
     `record that the thought happened, and the day it came from knows it left one.\n\n` +
     `AI-generated per fleet Rule 6: assembled by an oracle, commissioned by Nat Weerawan.\n`);
