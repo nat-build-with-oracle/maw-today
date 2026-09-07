@@ -1,6 +1,6 @@
 {
   "name": "today",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "entry": "./src/index.ts",
   "sdk": "^1.0.0",
   "description": "What happened today on this machine — commits across the ghq tree, and Claude Code sessions touched.",
@@ -10,7 +10,7 @@
     "aliases": [
       "td"
     ],
-    "help": "maw today — sessions at a glance · commits (nested repo listing) · all · tui · tomorrow · idea <title> · --since 3d · --json"
+    "help": "maw today — sessions at a glance · commits (nested repo listing) · all · tui · tomorrow · idea <title> · wrapup [--dry-run] · --since 3d · --json"
   },
   "capabilities": [
     "fs:read"

@@ -70,10 +70,15 @@ the second attempt. During install the link must not exist in any form:
 ```
 rm psi                                           # it is one symlink; trivially recreated
 maw plugin remove today --yes; maw plugin install "$PWD"
-ln -sn ../.. psi                                 # restore the lab's link
+ln -sn ψ psi                                     # restore the link (self-contained since 2026-09-01)
 rm -rf ~/.maw/plugins/today/psi                  # installer materialised SOMETHING here
-ln -sn /opt/Code/github.com/laris-co/neo-oracle/ψ ~/.maw/plugins/today/psi
 ```
+
+Self-contained, `psi -> ψ` cannot cycle — the ritual is now habit, not survival. The
+installed copy needs no psi at all: no code path reads it (days live in day repos,
+found via `ghq root`). Last done 2026-09-07 for today@0.2.0 (idea + wrapup verbs);
+verified through `maw today …` itself, not `bun src/index.ts`, because the installed
+copy is what the fleet's skills call.
 
 ## Spinoff (done, 2026-09-01)
 
