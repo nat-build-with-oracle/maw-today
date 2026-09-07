@@ -6,6 +6,8 @@
 //   maw today all                  all three
 //   maw today --since 3d           widen the window (1d | 3d | 2h | YYYY-MM-DD)
 //   maw today --json               machine-readable
+//   maw today tomorrow             pre-birth tomorrow's day repo
+//   maw today idea <title>         birth an idea capsule — PRIVATE repo idea-7sep-<slug>, linked from today
 //
 // ┌──────────────────────────────────────────────────────────────────────────┐
 // │  WHY THE PREFILTER EXISTS — this is the whole design.                    │
@@ -32,7 +34,7 @@
 
 import { execFile } from "node:child_process";
 import { stat, readdir } from "node:fs/promises";
-import { mkdirSync, writeFileSync, existsSync, realpathSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, realpathSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -471,6 +473,19 @@ export function writeDigest(commits: Commit[], sessions: Session[], label: strin
       for (const s of bgs) L.push(sesLine(s, ""));
     }
   } else for (const s of sessions) L.push(sesLine(s, ""));
+
+  // What the day LEFT — ideas born from it by `maw today idea`, each a repo of its own,
+  // pointed at from ψ/outbox/ideas/. Read from disk, not from memory: the pointer file is
+  // the record, and a digest rewritten at 23:00 must still list a 07:00 idea.
+  const ideasDir = join(psi, "outbox", "ideas");
+  const ideas = existsSync(ideasDir) ? readdirSync(ideasDir).filter((f) => f.endsWith(".md")).sort() : [];
+  if (ideas.length) {
+    L.push("", `## Ideas`, "");
+    for (const f of ideas) {
+      const first = readFileSync(join(ideasDir, f), "utf8").split("\n")[0].replace(/^#\s*/, "");
+      L.push(`- [${first}](../../outbox/ideas/${f})`);
+    }
+  }
   L.push("", `_written by maw today digest, ${new Date().toISOString()}_`, "");
   writeFileSync(f, L.join("\n"));
   return f;
@@ -547,6 +562,22 @@ export function dayRepoSlug(d = new Date()): string {
   return `${daySlug(d)}${d.getFullYear()}-oracle`;
 }
 
+/** A repo-safe slug from an idea title: GitHub repo names are ASCII letters, digits,
+ *  `-` — so accents fold (café → cafe) and everything else becomes a hyphen. A Thai
+ *  title slugs to "" on purpose; the caller asks for --slug rather than inventing one. */
+export function ideaSlug(title: string): string {
+  return title.normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48).replace(/-+$/, "");
+}
+
+/** The idea's REPO name — "idea-7sep-<slug>" (Nat, 2026-09-07). Day-month without
+ *  weekday or year: the name is for the thought, the date only says when it struck. The
+ *  accepted trade is the same as daySlug's — a same-slug idea on the same day-of-year in
+ *  a later year collides; `already born` says so instead of overwriting. */
+export function ideaRepoSlug(slug: string, d = new Date()): string {
+  return `idea-${d.getDate()}${d.toLocaleString("en", { month: "short" }).toLowerCase()}-${slug}`;
+}
+
 /**
  * Create-or-refresh the day's PRIVATE repo and push. Extracted so three callers share
  * ONE body — the `new`/`repo` verbs and the default `maw today` auto-sync — because the
@@ -608,14 +639,35 @@ async function syncDayRepo(
 
 /** The /awaken-shaped skeleton + CLAUDE.md for one day repo. Shared by syncDayRepo
  *  (today) and the plan verb (a FUTURE day, pre-birthed so the plan has a home). */
+/** The /awaken vault skeleton every capsule this plugin births shares — a day, an idea.
+ *  .gitkeep in each leaf so an empty vault survives git; `extra` dirs get none (a day's
+ *  memory/days is filled by the digest the same moment it is made). */
+const VAULT_DIRS = ["inbox", "outbox", "writing", "lab", "archive", "memory/resonance",
+                    "memory/learnings", "memory/retrospectives", "memory/traces"];
+function scaffoldVault(vault: string, extra: string[] = []) {
+  for (const d of [...VAULT_DIRS, ...extra]) mkdirSync(join(vault, d), { recursive: true });
+  for (const d of VAULT_DIRS) writeFileSync(join(vault, d, ".gitkeep"), "");
+}
+
+/** The idea capsule: the shared vault skeleton, its own CLAUDE.md, and a README — the
+ *  README is what github.com shows when browsing the org, so the title must be there. */
+function scaffoldIdea(dir: string, repoSlug: string, title: string, born: string, dayRepo: string) {
+  scaffoldVault(join(dir, "ψ"));
+  writeFileSync(join(dir, "README.md"), `# ${title}\n\nborn ${born} from ${dayRepo} · \`${repoSlug}\`\n`);
+  writeFileSync(join(dir, "CLAUDE.md"),
+    `# ${repoSlug} — an idea, kept\n\n` +
+    `> ${title}\n\n` +
+    `Born ${born} from the day ${dayRepo}, by 'maw today idea'\n` +
+    `(nat-build-with-oracle/maw-today).\n\n` +
+    `An idea capsule, not yet a project: the /awaken-shaped vault holds whatever the\n` +
+    `idea grows — notes in ψ/inbox, drafts in ψ/writing, experiments in ψ/lab. If it\n` +
+    `becomes real, /incubate or /awaken it from here; if it never does, it stays as the\n` +
+    `record that the thought happened, and the day it came from knows it left one.\n\n` +
+    `AI-generated per fleet Rule 6: assembled by an oracle, commissioned by Nat Weerawan.\n`);
+}
+
 function scaffoldDay(dir: string, vault: string, repoSlug: string, fileSlug: string) {
-  for (const d of ["inbox", "outbox", "writing", "lab", "archive",
-                   "memory/resonance", "memory/learnings", "memory/retrospectives",
-                   "memory/traces", "memory/days"])
-    mkdirSync(join(vault, d), { recursive: true });
-  for (const d of ["inbox", "outbox", "writing", "lab", "archive", "memory/resonance",
-                   "memory/learnings", "memory/retrospectives", "memory/traces"])
-    writeFileSync(join(vault, d, ".gitkeep"), "");
+  scaffoldVault(vault, ["memory/days"]);
   writeFileSync(join(dir, "CLAUDE.md"),
     `# ${repoSlug} — a day, kept\n\n` +
     `> One day of the fleet, captured as a repo. Written by 'maw today'\n` +
@@ -721,6 +773,61 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
     return { ok: true, output: buf2.length ? buf2.join("\n") : undefined };
   }
 
+  // IDEA — an idea capsule born from today (Nat, 2026-09-07: "idea-7sep-xxxxx"). The
+  // SAME birth as a day: the /awaken vault, a PRIVATE repo under the org, commit + push
+  // on first contact — but named for the thought, not the date, and linked BOTH ways:
+  // the idea's CLAUDE.md names the day it came from, and the day's ψ/outbox/ideas/<slug>.md
+  // names the idea (the digest lists that folder). A day remembers what it left; an idea
+  // remembers where it started. The homelab MOVED.md two-way link, applied at birth.
+  if (sub === "idea") {
+    const buf3: string[] = [];
+    const say = async (l: string) => { if (ctx.writer) await ctx.writer(l); else buf3.push(l); };
+    // Title = every word after `idea` that is not a flag or a flag's value. Quotes do not
+    // survive maw's whitespace split, so the words are joined back with single spaces.
+    const rest = args.slice(args.indexOf("idea") + 1);
+    const words: string[] = [];
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i].startsWith("--")) { if (rest[i] !== "--json") i++; continue; }
+      words.push(rest[i]);
+    }
+    const title = words.join(" ").trim() || flag("slug") || "";
+    // GitHub repo names are ASCII — a Thai title slugs to nothing, so --slug names the
+    // repo while the title keeps the Thai. Neither is guessed from the other.
+    const slug = ideaSlug(flag("slug") ?? title);
+    if (!title) return { ok: false, error: "maw today idea <title> [--slug name] — an idea needs a title" };
+    if (!slug) return { ok: false, error: `"${title}" has no ASCII letters for a repo name — add --slug <name>` };
+    const org = process.env.MAW_TODAY_ORG || "nat-build-with-oracle";
+    let ghqRoot = "";
+    try { ghqRoot = (await run("ghq", ["root"])).stdout.trim(); }
+    catch { return { ok: false, error: "ghq not available — cannot place the idea repo" }; }
+    const repoSlug = ideaRepoSlug(slug);
+    const dir = join(ghqRoot, "github.com", org, repoSlug);
+    if (existsSync(join(dir, "CLAUDE.md")))
+      return { ok: true, output: `${org}/${repoSlug} already born — ${dir}` };
+    const dayRepo = dayRepoSlug(), dayFile = daySlug();
+    const dayDir = join(ghqRoot, "github.com", org, dayRepo);
+    const born = `${hhmmLocal(Date.now())} ${tzTag()} ${dayFile}`;
+
+    await say(`▓ idea — ${org}/${repoSlug}`);
+    scaffoldIdea(dir, repoSlug, title, born, `${org}/${dayRepo}`);
+    await commitPushDay(dir, org, repoSlug, `idea: ${title} — born ${dayFile}`, say);
+
+    // The day's half of the link. A day not yet born gets the same pre-birth `tomorrow`
+    // gives — an idea is a fine first thing for a day to hold; bare `maw today` refreshes it.
+    if (!existsSync(join(dayDir, "CLAUDE.md"))) {
+      await say(`▓ day not born yet — scaffolding ${org}/${dayRepo}`);
+      scaffoldDay(dayDir, join(dayDir, "ψ"), dayRepo, dayFile);
+    }
+    const ideasDir = join(dayDir, "ψ", "outbox", "ideas");
+    mkdirSync(ideasDir, { recursive: true });
+    writeFileSync(join(ideasDir, `${slug}.md`),
+      `# ${title}\n\n- born: ${born}\n- repo: ${org}/${repoSlug}\n- dir: ${dir}\n`);
+    await say(`▓ linked from ${dayRepo} → ψ/outbox/ideas/${slug}.md`);
+    await commitPushDay(dayDir, org, dayRepo, `day: ${dayFile} — idea ${slug}`, say);
+    await say(`▓ ${dir}`);
+    return { ok: true, output: buf3.length ? buf3.join("\n") : undefined };
+  }
+
   if (sub === "digest") {
     const winAt = since0(flag("since"));   // once — see syncDayRepo
     const [commits, sessions, gh] = await Promise.all([
@@ -733,7 +840,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   }
 
   if (!["all", "commits", "sessions", "gh"].includes(sub)) {
-    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, gh, digest, tomorrow, new, repo, tui, or all` };
+    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, gh, digest, tomorrow, idea, new, repo, tui, or all` };
   }
 
   let since: { at: number; label: string };

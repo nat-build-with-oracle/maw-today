@@ -10,7 +10,7 @@
     "aliases": [
       "td"
     ],
-    "help": "maw today — sessions at a glance · commits (nested repo listing) · all · tui · --since 3d · --json"
+    "help": "maw today — sessions at a glance · commits (nested repo listing) · all · tui · tomorrow · idea <title> · --since 3d · --json"
   },
   "capabilities": [
     "fs:read"

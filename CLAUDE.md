@@ -18,6 +18,9 @@ maw today                 commits + sessions since local midnight
 maw today commits|sessions
 maw today tui             live dashboard — a/c/s views, +/- window, w writes a digest
 maw today --since 3d --json
+maw today tomorrow        pre-birth tomorrow's day repo (--date YYYY-MM-DD for any day)
+maw today idea <title>    birth an idea capsule — PRIVATE idea-7sep-<slug>, linked from today
+                          (--slug name when the title is Thai: repo names are ASCII)
 bun src/index.ts …        the same thing before the plugin is installed
 ```
 
@@ -106,5 +109,10 @@ to its own entry file, which is why nothing else changed.
 
 Each DAY REPO (nat-build-with-oracle/<slug>) carries the real vault:
 ψ/memory/days/<slug>.md        the digest — 1sep-tue.md style
+ψ/outbox/ideas/<slug>.md       one pointer per idea born from this day (the digest lists them)
 ψ/memory/retrospectives/ …     the rest of the /awaken shape, for what the day leaves
+
+Each IDEA REPO (nat-build-with-oracle/idea-7sep-<slug>, Nat 2026-09-07) is the same
+/awaken skeleton with its own CLAUDE.md + README naming the day it came from — the
+two-way link at birth. Not yet a project; /incubate or /awaken it from there if it grows.
 ```
