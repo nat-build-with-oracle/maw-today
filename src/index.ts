@@ -1,3 +1,5 @@
+import { sessionInventory, renderSessions } from "./session-chain";
+import { buildWrapupBundle } from "./wrapup-bundle";
 // maw today — what happened on this machine today.
 //
 //   maw today                      sessions since local midnight (fast, one screen)
@@ -34,8 +36,8 @@
 
 import { execFile } from "node:child_process";
 import { stat, readdir } from "node:fs/promises";
-import { mkdirSync, writeFileSync, existsSync, realpathSync, readdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, writeFileSync, existsSync, realpathSync, readdirSync, readFileSync, appendFileSync, mkdtempSync, rmSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { promisify } from "node:util";
@@ -137,7 +139,7 @@ async function candidates(repos: string[], since: number): Promise<string[]> {
   return hits;
 }
 
-async function commitsIn(repo: string, since: number): Promise<Commit[]> {
+async function commitsIn(repo: string, since: number, strict = false): Promise<Commit[]> {
   try {
     // %x1f is a unit separator: subjects contain every other delimiter you might pick.
     const { stdout } = await run(
@@ -150,7 +152,8 @@ async function commitsIn(repo: string, since: number): Promise<Commit[]> {
       const [hash, at, author, subject] = line.split("\x1f");
       return { repo, hash: hash.slice(0, 7), at: Number(at) * 1000, author, subject };
     });
-  } catch {
+  } catch (e) {
+    if (strict) throw e;
     return [];
   }
 }
@@ -163,6 +166,7 @@ export async function gitToday(
   since: number,
   onRepo?: (repo: string, commits: Commit[]) => void | Promise<void>,
   onScan?: (repoCount: number, candidateCount: number) => void | Promise<void>,
+  strict = false,
 ): Promise<Commit[]> {
   const repos = await ghqRepos();
   const cand = await candidates(repos, since);
@@ -171,7 +175,7 @@ export async function gitToday(
   const CHUNK = 16; // process spawns, not stats — keep this small
   for (let i = 0; i < cand.length; i += CHUNK) {
     const slice = cand.slice(i, i + CHUNK);
-    const batch = await Promise.all(slice.map((r) => commitsIn(r, since)));
+    const batch = await Promise.all(slice.map((r) => commitsIn(r, since, strict)));
     for (let j = 0; j < batch.length; j++) {
       await onRepo?.(slice[j], batch[j]);   // fires on zero commits too — a check is an event
       out.push(...batch[j]);
@@ -258,7 +262,7 @@ export async function sessionsToday(since: number): Promise<Session[]> {
 // ---- github: the upstream half ----------------------------------------------
 
 export type GhItem = {
-  kind: "pr-opened" | "pr-merged" | "issue-closed";
+  kind: "pr-opened" | "pr-merged" | "issue-closed" | "issue-opened";
   repo: string; number: number; title: string; author: string; at: number; url: string;
 };
 
@@ -280,8 +284,8 @@ const ghOwners = () => {
 /**
  * PRs opened, PRs merged, issues closed since `since` — the Workshop-03 upstream half:
  * commits alone hid maw-js's sprint day (229 commits read as blobs until 198 opened /
- * 173 merged / 125 closed revealed a team closeout). Three parallel searches, ~3s wall,
- * 3 of the 30/min search budget. The date is a full ISO instant — honored server-side
+ * 173 merged / 125 closed revealed a team closeout). Four parallel searches including issues opened for wrapup.
+ * 4 of the 30/min search budget. The date is a full ISO instant — honored server-side
  * (boundary-probed), so no bare-date UTC-midnight truncation trap.
  * THROWS on any failure instead of returning fake zeros: a category emptied by a
  * network error is exactly the false-zero Odin's flights exist to catch.
@@ -312,25 +316,26 @@ export async function ghToday(since: number): Promise<GhDay> {
       // the merge instant, while updatedAt drifts to the last touch of any kind and
       // bends the braid's causality adjacency. 0 = unparseable, rendered "--:--",
       // never a fabricated plausible time.
-      at: Date.parse((kind === "pr-opened" ? r.createdAt : r.closedAt ?? r.updatedAt) ?? "") || 0,
+      at: Date.parse((kind.endsWith("opened") ? r.createdAt : r.closedAt ?? r.updatedAt) ?? "") || 0,
       url: r.url ?? "",
     }));
     return { items, truncated: rows.length === LIMIT };
   };
-  const [opened, merged, closed] = await Promise.all([
+  const [opened, merged, closed, issues] = await Promise.all([
     search("prs", "--created", "pr-opened"),
     search("prs", "--merged-at", "pr-merged"),
     search("issues", "--closed", "issue-closed"),
+    search("issues", "--created", "issue-opened"),
   ]);
   // A PR opened AND merged today appears twice — that is two events, kept deliberately.
   return {
-    items: [...opened.items, ...merged.items, ...closed.items].sort((a, b) => a.at - b.at),
-    truncated: opened.truncated || merged.truncated || closed.truncated,
+    items: [...opened.items, ...merged.items, ...closed.items, ...issues.items].sort((a, b) => a.at - b.at),
+    truncated: opened.truncated || merged.truncated || closed.truncated || issues.truncated,
   };
 }
 
 export const GH_MARK: Record<GhItem["kind"], string> = {
-  "pr-opened": "⇧ PR", "pr-merged": "✓ PR", "issue-closed": "⊘ issue",
+  "pr-opened": "⇧ PR", "pr-merged": "✓ PR", "issue-closed": "⊘ issue", "issue-opened": "⇧ issue",
 };
 
 const ghCounts = (gh: GhItem[]) => ({
@@ -591,6 +596,8 @@ async function syncDayRepo(
   ctx: InvokeContext,
   mode: "new" | "repo" | "auto",
   sinceSpec?: string,
+  localOnly = false,
+  gathered?: (gh: GhDay | null, commits: Commit[], sessions: Session[]) => void,
 ): Promise<InvokeResult> {
   const buf: string[] = [];
   const say = async (l: string) => { if (ctx.writer) await ctx.writer(l); else buf.push(l); };
@@ -623,16 +630,17 @@ async function syncDayRepo(
   // milliseconds apart, and "the same window" should be literally the same number.
   const winAt = since0(sinceSpec);
   const [commits, sessions, gh] = await Promise.all([
-    gitToday(winAt), sessionsToday(winAt),
+    gitToday(winAt, undefined, undefined, localOnly), sessionsToday(winAt),
     ghToday(winAt).catch(() => null),   // null = unreachable; digest says so
   ]);
+  gathered?.(gh, commits, sessions);
   const f = writeDigest(commits, sessions, resolveSince(sinceSpec).label, vault, gh, winAt);
   const ghNote = gh
     ? (() => { const n = ghCounts(gh.items); return ` · ${n.opened}⇧ ${n.merged}✓ ${n.closed}⊘${gh.truncated ? " (floors)" : ""}`; })()
     : ` · gh unreachable`;
   await say(`▓ ${commits.length} commits · ${sessions.length} sessions${ghNote} → ${f}`);
 
-  await commitPushDay(dir, org, repoSlug,
+  if (!localOnly) await commitPushDay(dir, org, repoSlug,
     `day: ${fileSlug} — ${commits.length} commits · ${sessions.length} sessions`, say);
   return { ok: true, output: buf.length ? buf.join("\n") : undefined };
 }
@@ -701,6 +709,176 @@ async function commitPushDay(dir: string, org: string, repoSlug: string, subject
   }
 }
 
+export type WorkerRow = {
+  oracle: string; worker: string; body: string; state: string;
+  contextLeft: number | null; ahead: number | null; cwd: string | null;
+  cwdCheck: string; lastLine: string | null;
+};
+
+export function parseWorkers(oracle: string, status: string, verify: string): WorkerRow[] {
+  const blocks = new Map<string, string[]>();
+  let name = "";
+  for (const line of verify.split("\n")) {
+    const header = /^── (.+) ──$/.exec(line.trim());
+    if (header) { name = header[1]; blocks.set(name, []); }
+    else if (name) blocks.get(name)!.push(line);
+  }
+  return status.split("\n").flatMap(line => {
+    const m = /^\s*(\S+)\s+\[(main|wt)\]\s+(WORKING|idle)(?:\s+Context (\d+)% left)?\s*$/.exec(line);
+    if (!m) return [];
+    const block = blocks.get(m[1]);
+    const ahead = !block || block.some(l => /no branch|fatal:|error:/.test(l)) ? null
+      : block.filter(l => /^\s*[a-f0-9]{7,40}\s/.test(l)).length;
+    return [{ oracle, worker: m[1], body: m[2], state: m[3],
+      contextLeft: m[4] ? +m[4] : null, ahead, cwd: null,
+      cwdCheck: "unknown", lastLine: null }];
+  });
+}
+
+const cell = (v: unknown) => String(v ?? "unknown").replace(/\|/g, "\\|").replace(/[\r\n]/g, " ");
+export function workersTable(rows: WorkerRow[]): string {
+  return ["| oracle | worker | body | state | context % left | ahead of main | cwd check | last screen line |",
+    "|---|---|---|---|---|---|---|---|",
+    ...rows.map(r => `| ${[r.oracle, r.worker, r.body, r.state, r.contextLeft, r.ahead, r.cwdCheck, r.lastLine].map(cell).join(" | ")} |`)].join("\n");
+}
+
+export function charterBullets(readme: string): string[] {
+  const section = /^## Charter-lite\s*\r?\n([\s\S]*?)(?=^##? |$(?![\s\S]))/m.exec(readme)?.[1] ?? "";
+  return section.split("\n").filter(l => /^- \*\*(Done-when|Escalate)\*\*:/.test(l));
+}
+
+export async function prepareFleet(dir: string, fleetDir: string, dryRun: boolean, execute = run) {
+  mkdirSync(fleetDir, { recursive: true });
+  // The upstream writer always stamps and updates latest/INDEX. Isolate dry runs,
+  // publish only four stable filenames, and leave real-run history untouched.
+  const destination = dryRun ? mkdtempSync(join(fleetDir, ".dry-run-")) : fleetDir;
+  try {
+    const prep = await execute("python3", [join(homedir(), ".claude/skills/maw-teams/scripts/maw_teams.py"), "--restart-prep"],
+      { cwd: dir, env: { ...process.env, MAW_SNAPSHOT_DIR: destination, MAW_SNAPSHOT_KEEP: "1000000" }, maxBuffer: 16 << 20 });
+    const reported = /^wake plan:\s*(.+)$/m.exec(String(prep.stdout))?.[1].trim();
+    if (!reported || dirname(reported) !== destination) throw new Error("restart-prep did not report a day-local wake plan");
+    const snapshotText = readFileSync(join(destination, "latest.json"), "utf8");
+    const snapshot = JSON.parse(snapshotText);
+    if (!dryRun) return { wakePlan: reported, snapshot };
+    const sourceJSON = join(destination, basename(realpathSync(join(destination, "latest.json"))));
+    const wakePlan = join(fleetDir, "dry-run_wake-plan.md");
+    const rewrite = (text: string) => text.split(sourceJSON).join(join(fleetDir, "dry-run_fleet.json"))
+      .split(sourceJSON.replace(/\.json$/, ".md")).join(join(fleetDir, "dry-run_fleet.md"))
+      .split(reported).join(wakePlan);
+    writeFileSync(join(fleetDir, "dry-run_fleet.json"), snapshotText);
+    writeFileSync(join(fleetDir, "dry-run_fleet.md"), rewrite(readFileSync(sourceJSON.replace(/\.json$/, ".md"), "utf8")));
+    writeFileSync(wakePlan, rewrite(readFileSync(reported, "utf8")));
+    return { wakePlan, snapshot };
+  } finally {
+    if (dryRun) rmSync(destination, { recursive: true, force: true });
+  }
+}
+
+export async function sweepOracle(repo: string, execute = run) {
+  const warnings: string[] = [], blockingErrors: string[] = [];
+  const result = { repo, status: "", verify: "", statusCheck: "unknown", verifyCheck: "unknown", warnings, blockingErrors };
+  const cwd = join(repo, "ψ/teams");
+  let recipes: Set<string>;
+  try { recipes = new Set(String((await execute("just", ["--summary"], { cwd, timeout: 30000 })).stdout).trim().split(/\s+/)); }
+  catch (e: any) { blockingErrors.push(`${repo}: just --summary: ${e.message}`); return result; }
+  for (const verb of ["status", "verify"] as const) {
+    const check = verb === "status" ? "statusCheck" : "verifyCheck";
+    if (!recipes.has(verb)) {
+      result[check] = `${verb}: n/a (no recipe)`;
+      warnings.push(`${repo}: ${result[check]}`);
+      continue;
+    }
+    try {
+      result[verb] = String((await execute("just", [verb], { cwd, timeout: 30000, maxBuffer: 4 << 20 })).stdout);
+      result[check] = `${verb}: ok`;
+    } catch (e: any) {
+      result[check] = `${verb}: failed`;
+      blockingErrors.push(`${repo}: just ${verb}: ${e.message}`);
+      result[verb] = String(e.stdout || "");
+    }
+  }
+  return result;
+}
+
+async function wrapup(dryRun: boolean, json: boolean): Promise<InvokeResult> {
+  try {
+    const root = (await run("ghq", ["root"])).stdout.trim();
+    const org = process.env.MAW_TODAY_ORG || "nat-build-with-oracle";
+    const dir = join(root, "github.com", org, dayRepoSlug());
+    // Refresh locally even in real mode: publication belongs AFTER all gathering.
+    let github: GhDay | null = null;
+    let dayCommits: Commit[] = [], daySessions: Session[] = [];
+    const refreshed = await syncDayRepo({}, "repo", undefined, true, (g, c, s) => { github = g; dayCommits = c; daySessions = s; });
+    if (!refreshed.ok) return refreshed;
+    const fleetDir = join(dir, "ψ/memory/fleet");
+    const { wakePlan, snapshot } = await prepareFleet(dir, fleetDir, dryRun);
+    const sessions = await sessionInventory(join(homedir(), ".claude/projects"), join(homedir(), ".codex/sessions"), since0(), Date.now(), snapshot);
+    const sessionsMarkdown = renderSessions(sessions);
+    appendFileSync(wakePlan, `\n${sessionsMarkdown}\n`);
+    const rows: WorkerRow[] = [], warnings: string[] = [], blockingErrors: string[] = [], charters: string[] = [];
+    const repos = (await run("ghq", ["list", "-p"])).stdout.trim().split("\n").filter(Boolean);
+    const sweep: Awaited<ReturnType<typeof sweepOracle>>[] = [];
+    for (const repo of repos) {
+      const teams = join(repo, "ψ/teams");
+      if (!existsSync(join(teams, "justfile"))) continue;
+      const result = await sweepOracle(repo);
+      sweep.push(result);
+      warnings.push(...result.warnings);
+      blockingErrors.push(...result.blockingErrors);
+      const { status, verify } = result;
+      const local = parseWorkers(repo.slice(root.length + 1), status, verify);
+      for (const row of local) {
+        const panes = snapshot.sessions.flatMap((s: any) => s.panes).filter((p: any) =>
+          p.name === row.worker && (p.repo === row.oracle || p.cwd === repo || p.cwd?.startsWith(repo + "/")));
+        if (panes.length === 1) {
+          row.cwd = panes[0].cwd;
+          row.lastLine = panes[0].screen?.at(-1) ?? null;
+          row.cwdCheck = !row.cwd ? "unknown" : [join(repo, "ψ/lab", row.worker), join(repo, "agents", row.worker, "ψ/lab", row.worker)].includes(row.cwd)
+            ? "ok" : `MISMATCH: ${row.cwd}`;
+        }
+        const readme = join(repo, "ψ/lab", row.worker, "README.md");
+        if (existsSync(readme)) {
+          const lines = charterBullets(readFileSync(readme, "utf8"));
+          charters.push(`### ${row.oracle} / ${row.worker}\nSource: ${readme}\n${lines.join("\n") || "Charter lines missing — escalate."}`);
+        }
+      }
+      rows.push(...local);
+    }
+    if (!sweep.length) blockingErrors.push("Zero oracles swept");
+    const oracleTable = ["| oracle | status | verify |", "|---|---|---|", ...sweep.map(s => `| ${cell(s.repo)} | ${s.statusCheck} | ${s.verifyCheck} |`)].join("\n");
+    const table = workersTable(rows) + "\n\n### Oracle recipe coverage\n" + oracleTable;
+    appendFileSync(wakePlan, `\n## Workers\n\n${table}\n\n${warnings.map(w => `- ${cell(w)}`).join("\n")}\n`);
+    const gh = github as GhDay | null;
+    if (!gh) blockingErrors.push("GitHub unavailable: issue list unknown; do not post comments.");
+    if (gh?.truncated) warnings.push("GitHub results truncated: issue list incomplete; reconcile before commenting.");
+    const issues = gh?.items.filter(g => g.kind === "issue-opened") ?? [];
+    const prs = gh?.items.filter(g => g.kind === "pr-opened") ?? [];
+    const digest = join(dir, "ψ/memory/days", `${daySlug()}.md`);
+    const prompt = wakePlan.replace(/_wake-plan\.md$/, "_wrapup-prompt.md");
+    const oracle = dayRepoSlug().replace(/-oracle$/, "");
+    const lead = snapshot.sessions.find((s: any) => s.name.replace(/^\d+-/, "") === oracle);
+    const sessionClocks = snapshot.sessions.flatMap((s: any) => s.panes.map((p: any) => ({
+      session: s.name, worker: p.name, repo: p.repo, session_id: p.session_id,
+      session_start: p.session_start, session_end: p.session_end,
+      source: "maw-teams restart-prep: observed today's activity timestamps",
+    })));
+    writeFileSync(prompt, buildWrapupBundle({ now: new Date(), dir, slug: daySlug(), wakePlan,
+      dryRun, signature: `[${lead?.name ?? "unknown"}:${oracle}]`,
+      digest: readFileSync(digest, "utf8"), table, charters, warnings, blockingErrors,
+      commits: dayCommits, sessions: daySessions, sessionInventory: sessions, sessionsMarkdown, issues, prs, rows, sessionClocks, sweptCount: sweep.length,
+    }));
+    if (!dryRun) {
+      if (blockingErrors.length) throw new Error(`Gathering incomplete; no publication: ${blockingErrors.join("; ")}. Prompt: ${prompt}`);
+      const tomorrow = await handler({ args: ["tomorrow"] });
+      if (!tomorrow.ok) return tomorrow;
+      await commitPushDay(dir, org, dayRepoSlug(), `day: ${daySlug()} — wrapup`, async () => {});
+    }
+    const afterReboot = [`cd ${dir}`, `cat ${wakePlan}`, "Say I'm back → /maw-wake"];
+    return { ok: true, output: json ? JSON.stringify({ dryRun, dayRepo: dir, wakePlan, prompt, rows, sessions, warnings, blockingErrors, oracleResults: sweep.map(({ repo, statusCheck, verifyCheck }) => ({ repo, statusCheck, verifyCheck })), sweptRepos: sweep.map(s => s.repo), afterReboot }, null, 2)
+      : `${dryRun ? "DRY RUN — no commit/push/tomorrow" : "Wrapup complete"}\n${table}\nprompt: ${prompt}\n${afterReboot.join("\n")}` };
+  } catch (e) { return { ok: false, error: String((e as Error).message) }; }
+}
+
 export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   const args = asArgs(ctx.args);
   const flag = (n: string) => {
@@ -728,6 +906,8 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   // itself (see tui.ts terminal IO). Passing tty fds through stdio here was tried and
   // is WORSE — Bun 1.3.14 leaves process.stdout undefined in a child with an fd-backed
   // stdout, and unrelated internals then throw in a WriteStream fast path.
+  if (sub === "wrapup") return wrapup(args.includes("--dry-run"), json);
+
   if (sub === "tui") {
     const { spawnSync } = await import("node:child_process");
     const here = dirname(fileURLToPath(import.meta.url));
@@ -840,7 +1020,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   }
 
   if (!["all", "commits", "sessions", "gh"].includes(sub)) {
-    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, gh, digest, tomorrow, idea, new, repo, tui, or all` };
+    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, gh, digest, wrapup, tomorrow, idea, new, repo, tui, or all` };
   }
 
   let since: { at: number; label: string };
