@@ -21,6 +21,10 @@ maw today --since 3d --json
 maw today tomorrow        pre-birth tomorrow's day repo (--date YYYY-MM-DD for any day)
 maw today idea <title>    birth an idea capsule — PRIVATE idea-7sep-mon2026-<slug>, linked from today
                           (--slug name when the title is Thai: repo names are ASCII)
+maw today ls               every jsonl touched today — Claude + Codex, read-only. Same
+                          liveness detection as wrapup (session-chain.ts: bounded
+                          three-tier walk, lead/subagent/workflow_agent + Codex
+                          rollouts), just no fleet/tmux sweep — a look, not a sweep.
 bun src/index.ts …        the same thing before the plugin is installed
 ```
 

@@ -1,4 +1,4 @@
-import { sessionInventory, renderSessions } from "./session-chain";
+import { sessionInventory, renderSessions, type SessionNode } from "./session-chain";
 import { buildWrapupBundle } from "./wrapup-bundle";
 // maw today — what happened on this machine today.
 //
@@ -10,6 +10,7 @@ import { buildWrapupBundle } from "./wrapup-bundle";
 //   maw today --json               machine-readable
 //   maw today tomorrow             pre-birth tomorrow's day repo
 //   maw today idea <title>         birth an idea capsule — PRIVATE repo idea-7sep-mon2026-<slug>, linked from today
+//   maw today ls                   every jsonl touched today — Claude + Codex, read-only, full liveness detection
 //
 // ┌──────────────────────────────────────────────────────────────────────────┐
 // │  WHY THE PREFILTER EXISTS — this is the whole design.                    │
@@ -1024,6 +1025,44 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
     return { ok: true, output: buf3.length ? buf3.join("\n") : undefined };
   }
 
+  // LS — every jsonl touched today, Claude + Codex, read-only (Nat, 2026-09-12: "list
+  // all jsonl updated today"). Reuses `wrapup`'s liveness detection (session-chain.ts:
+  // bounded three-tier walk, never a filesystem sweep) with NO fleet snapshot — `ls` is
+  // a look, not a sweep of every oracle's tmux panes, so tmux/worker-vs-lead refinement
+  // is skipped and role stays whatever the file's own shape says (lead/subagent/
+  // workflow_agent from Claude, lead from Codex — see sessionInventory's fleet-matching
+  // pass, which only runs when a session is actually passed).
+  if (sub === "ls") {
+    const winAt = since0(flag("since"));
+    const nodes = await sessionInventory(join(homedir(), ".claude/projects"), join(homedir(), ".codex/sessions"), winAt, Date.now(), {});
+    const label = resolveSince(flag("since")).label;
+    if (json) return { ok: true, output: JSON.stringify({ since: winAt, label, nodes }, null, 2) };
+    // sessionInventory sorts ascending (its own tree-render in `wrapup` wants that) —
+    // that puts every null-start node (touched today, no event actually IN today's
+    // window — "mtime is a liar's metric") FIRST, which reads as "everything is
+    // --:--" at a glance. Re-sort here, most recent first, nulls last: for a plain
+    // look at today, recency is what a human scans for.
+    const view = [...nodes].sort((a, b) => (b.start ?? "").localeCompare(a.start ?? ""));
+    const counts = (k: "role" | "engine") => {
+      const m = new Map<string, number>();
+      for (const n of nodes) m.set(n[k], (m.get(n[k]) ?? 0) + 1);
+      return [...m.entries()].map(([k, v]) => `${v} ${k}`).join(" · ");
+    };
+    const lines: string[] = [`maw today ls — ${nodes.length} jsonl ${label === "today" ? "since local midnight" : label}` +
+      (nodes.length ? ` (${counts("engine")} — ${counts("role")})` : "")];
+    if (!nodes.length) lines.push("", "none");
+    else {
+      lines.push("");
+      const MARK: Record<SessionNode["role"], string> = { lead: "●", worker: "▮", subagent: "▯", workflow_agent: "▫" };
+      for (const n of view) {
+        const t = n.start ? n.start.slice(11, 16) : "--:--";
+        lines.push(`  ${t}  ${MARK[n.role]} ${n.id}  ${n.engine.padEnd(11)} ${n.role.padEnd(14)} ${short(n.cwd ?? n.path).padEnd(28)} ${bytes(n.size)}` +
+          (n.humanMsgs ? `  ${n.humanMsgs} msgs` : "") + (n.malformedLines ? `  ${n.malformedLines} malformed` : ""));
+      }
+    }
+    return { ok: true, output: lines.join("\n") };
+  }
+
   if (sub === "digest") {
     const winAt = since0(flag("since"));   // once — see syncDayRepo
     const [commits, sessions, gh] = await Promise.all([
@@ -1036,7 +1075,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   }
 
   if (!["all", "commits", "sessions", "gh"].includes(sub)) {
-    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, gh, digest, wrapup, tomorrow, idea, new, repo, tui, or all` };
+    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, gh, digest, ls, wrapup, tomorrow, idea, new, repo, tui, or all` };
   }
 
   let since: { at: number; label: string };
