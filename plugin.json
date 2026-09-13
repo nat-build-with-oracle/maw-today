@@ -1,6 +1,6 @@
 {
   "name": "today",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "entry": "./src/index.ts",
   "sdk": "^1.0.0",
   "description": "What happened today on this machine — commits across the ghq tree, and Claude Code sessions touched.",
