@@ -9,6 +9,15 @@ export type SessionNode = {
   parent: string | null; parentEvidence: string | null; workflow: string | null;
   tmux: string | null; cwd: string | null; start: string | null; end: string | null;
   humanMsgs: number; size: number; malformedLines: number;
+  // Claude Code's own `{"type":"ai-title","aiTitle":...}` event, verbatim — never a
+  // guessed excerpt. Codex rollouts carry no equivalent event: a first-human-turn
+  // fallback was tried (2026-09-13) and dropped the same day — real Codex sessions
+  // wrap the actual task in an AGENTS.md/plugin-recommendation preamble with no
+  // reliable end marker, so the "excerpt" surfaced boilerplate (`# AGENTS.md
+  // instructions`, `<recommended_plugins>`) as if it were a title on almost every row.
+  // `null` here means "no reliable title", not "nothing happened" — never render it as
+  // an empty string that could be misread the same way.
+  title: string | null;
 };
 type FileCandidate = { path: string; role: SessionNode["role"]; parent: string | null; workflow: string | null; engine: string };
 
@@ -73,6 +82,7 @@ export async function sessionInventory(claudeRoot: string, codexRoot: string, si
     let fullId = basename(f.path, ".jsonl").replace(/^agent-/, "");
     let metadataSeen = false, role = f.role, ownStart = since;
     let cwd: string | null = null, first = Infinity, last = -Infinity, humanMsgs = 0, malformedLines = 0;
+    let title: string | null = null;
     const lines = createInterface({ input: createReadStream(f.path), crlfDelay: Infinity });
     for await (const line of lines) {
       if (!line.trim()) continue;
@@ -86,6 +96,14 @@ export async function sessionInventory(claudeRoot: string, codexRoot: string, si
         const parentId = e.payload?.source?.subagent?.thread_spawn?.parent_thread_id;
         if (parentId) { parentIds.set(f.path, parentId); role = "subagent"; }
       }
+      // The title line carries no `timestamp` of its own (Claude's ai-title event has
+      // none at all), so it is captured UNGATED by the `at`-window check below — a
+      // session's title is a fact about the whole file, not an event inside a window.
+      // Codex has no equivalent event (see the SessionNode.title comment for why a
+      // first-human-turn fallback was tried and dropped): title stays null there.
+      if (!title && e.type === "ai-title" && typeof e.aiTitle === "string" && e.aiTitle.trim()) {
+        title = e.aiTitle.trim();
+      }
       if (!cwd) cwd = e.cwd ?? cwd;
       const at = Date.parse(e.timestamp ?? "");
       if (!Number.isFinite(at) || at < ownStart || at >= until) continue;
@@ -98,7 +116,8 @@ export async function sessionInventory(claudeRoot: string, codexRoot: string, si
     nodes.push({ id: fullId.slice(0, 8), fullId, path: f.path, engine: f.engine, role,
       parent: f.parent, parentEvidence: f.parent ? "filesystem subagents hierarchy" : null,
       workflow: f.workflow, tmux: null, cwd, start: Number.isFinite(first) ? bangkok(first) : null,
-      end: Number.isFinite(last) ? bangkok(last) : null, humanMsgs, size: info.size, malformedLines });
+      end: Number.isFinite(last) ? bangkok(last) : null, humanMsgs, size: info.size, malformedLines,
+      title });
   }
   for (const node of nodes) {
     const parentId = parentIds.get(node.path);
@@ -134,10 +153,11 @@ export async function sessionInventory(claudeRoot: string, codexRoot: string, si
 
 const cell = (s: unknown) => String(s ?? "unknown").replace(/\|/g, "\\|").replace(/[\r\n]/g, " ");
 export function renderSessions(nodes: SessionNode[]): string {
-  const table = ["## Sessions", "", "Observed window times in Asia/Bangkok; null means unknown. Parent keys are full paths. Worker edges are team-based inferences, not verified dispatch events.", "",
-    "| id | full .jsonl path | engine | role | tmux session:window | start | end | human msgs | size bytes |",
-    "|---|---|---|---|---|---|---|---|---|",
-    ...nodes.map(n => `| ${[n.id, n.path, n.engine, n.role, n.tmux, n.start, n.end, n.humanMsgs, n.size].map(cell).join(" | ")} |`)];
+  const table = ["## Sessions", "",
+    "Observed window times in Asia/Bangkok; null means unknown. Parent keys are full paths. Worker edges are team-based inferences, not verified dispatch events. `title` is Claude's own ai-title event; Codex has no equivalent, so it is blank there — never guessed.", "",
+    "| id | full .jsonl path | engine | role | tmux session:window | start | end | human msgs | size bytes | title |",
+    "|---|---|---|---|---|---|---|---|---|---|",
+    ...nodes.map(n => `| ${[n.id, n.path, n.engine, n.role, n.tmux, n.start, n.end, n.humanMsgs, n.size, n.title ?? ""].map(cell).join(" | ")} |`)];
   const paths = new Set(nodes.map(n => n.path)), seen = new Set<string>();
   const tree: string[] = [];
   const visit = (n: SessionNode, depth: number) => {

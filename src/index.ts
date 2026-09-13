@@ -1052,12 +1052,21 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
       (nodes.length ? ` (${counts("engine")} — ${counts("role")})` : "")];
     if (!nodes.length) lines.push("", "none");
     else {
-      lines.push("");
+      // Fixed column widths so every row lines up under the header — the plain
+      // padEnd-without-a-cap that shipped first let a long repo name push the rest of
+      // the row into a terminal wrap, which read as "which field is which?" (Nat,
+      // 2026-09-13). `trunc` caps instead of just padding.
+      const trunc = (s: string, n: number) => s.length > n ? s.slice(0, n - 1) + "…" : s;
+      const col = (s: string, n: number) => trunc(s, n).padEnd(n);
       const MARK: Record<SessionNode["role"], string> = { lead: "●", worker: "▮", subagent: "▯", workflow_agent: "▫" };
+      lines.push("",
+        `  start  · id        ${col("engine", 11)} ${col("role", 14)} ${col("project", 26)} ${col("size", 7)} msgs  title`);
       for (const n of view) {
         const t = n.start ? n.start.slice(11, 16) : "--:--";
-        lines.push(`  ${t}  ${MARK[n.role]} ${n.id}  ${n.engine.padEnd(11)} ${n.role.padEnd(14)} ${short(n.cwd ?? n.path).padEnd(28)} ${bytes(n.size)}` +
-          (n.humanMsgs ? `  ${n.humanMsgs} msgs` : "") + (n.malformedLines ? `  ${n.malformedLines} malformed` : ""));
+        // No Codex equivalent to Claude's ai-title exists (see SessionNode.title) —
+        // blank here, never a guessed excerpt standing in unlabeled.
+        lines.push(`  ${t}  ${MARK[n.role]} ${n.id}  ${col(n.engine, 11)} ${col(n.role, 14)} ${col(short(n.cwd ?? n.path), 26)} ${col(bytes(n.size), 7)} ${String(n.humanMsgs || "").padStart(4)}  ${trunc(n.title ?? "", 70)}` +
+          (n.malformedLines ? `  [${n.malformedLines} malformed]` : ""));
       }
     }
     return { ok: true, output: lines.join("\n") };
