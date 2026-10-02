@@ -4,6 +4,8 @@ import { daySlug } from "./mod.daySlug";
 import { ghCounts } from "./mod.ghCounts";
 import { ghToday } from "./mod.ghToday";
 import { gitToday } from "./mod.gitToday";
+import { clockOn } from "./mod.clockOn";
+import { groupByDay } from "./mod.groupByDay";
 import { hhmm } from "./mod.hhmm";
 import { parseWeekSpec } from "./mod.parseWeekSpec";
 import { resolveSince } from "./mod.resolveSince";
@@ -74,11 +76,27 @@ export async function cmdWindow(o: WindowOpts): Promise<InvokeResult> {
       const bg = split ? sessions.filter((s) => (s.typedAt ?? 0) < since.at) : [];
       await emit(`sessions  ${sessions.length} across ${projects} project${projects === 1 ? "" : "s"}` +
         (split ? ` — ${typed.length} typed 👤 · ${bg.length} background` : ""));
-      for (const s of typed)
-        await emit(`  ${hhmm(s.at)}  ${s.id}  ${short(s.project).padEnd(28)} ${bytes(s.bytes)}${split ? `  👤 ${hhmm(s.typedAt!)}` : ""}`);
+      // A window longer than today (maw week, --since 3d) gets a header per day
+      // (Nat, 2026-10-02: "can we know which day? section?"): rows sit under the day of
+      // their last write and print a bare clock; one day keeps the flat list it had.
+      const days = since.at < new Date().setHours(0, 0, 0, 0);
+      const typedRow = (s: Session, day?: number) =>
+        `  ${day === undefined ? hhmm(s.at) : clockOn(s.at, day)}  ${s.id}  ${short(s.project).padEnd(28)} ${bytes(s.bytes)}` +
+        (split ? `  👤 ${day === undefined ? hhmm(s.typedAt!) : clockOn(s.typedAt!, day)}` : "");
+      const bgRow = (s: Session, day?: number) =>
+        `    ${day === undefined ? hhmm(s.at) : clockOn(s.at, day)}  ${s.id}  ${short(s.project).padEnd(26)} ${bytes(s.bytes)}`;
+      if (!days) for (const s of typed) await emit(typedRow(s));
+      else for (const d of groupByDay(typed, (s) => s.at)) {
+        await emit(`  ── ${d.label} · ${d.rows.length} ──`);
+        for (const s of d.rows) await emit(typedRow(s, d.start));
+      }
       if (bg.length) {
         await emit(`  background — file moved, no typed input this window (listeners, agents, heartbeats):`);
-        for (const s of bg) await emit(`    ${hhmm(s.at)}  ${s.id}  ${short(s.project).padEnd(26)} ${bytes(s.bytes)}`);
+        if (!days) for (const s of bg) await emit(bgRow(s));
+        else for (const d of groupByDay(bg, (s) => s.at)) {
+          await emit(`    ── ${d.label} · ${d.rows.length} ──`);
+          for (const s of d.rows) await emit(bgRow(s, d.start));
+        }
       }
     }
     if (!wantCommits) await emit(`\ncommits: maw ${name} commits · all: maw ${name} all${week ? " · today: maw week today" : " · live: maw today tui · week: maw week"}`);
