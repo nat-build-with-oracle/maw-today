@@ -1,5 +1,6 @@
 import { WEEK_VERBS, type InvokeContext, type InvokeResult } from "./types";
 import { asArgs } from "./mod.asArgs";
+import { cmdApp } from "./mod.cmdApp";
 import { cmdDigest } from "./mod.cmdDigest";
 import { cmdIdea } from "./mod.cmdIdea";
 import { cmdLs } from "./mod.cmdLs";
@@ -38,7 +39,10 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   // `maw week` never writes: there is no week repo, and the day repo is today's.
   const isDefault = verb === undefined && !json && !week;
   if (week && !WEEK_VERBS.has(sub))
-    return { ok: false, error: `maw week reads a window; "${sub}" is not a week view (sessions, commits, gh, all).\n  maw today ${args.join(" ")}\n  maw week all` };
+    return { ok: false, error: `maw week reads a window; "${sub}" is not a week view (sessions, commits, gh, all, app).\n  maw today ${args.join(" ")}\n  maw week all` };
+
+  // The window as a 3D page — same window as the text view, so it reads the week too.
+  if (sub === "app") return cmdApp({ ctx, flag, json, sub, name, week, weekSpec, yearSpec, isDefault: false });
 
   if (sub === "wrapup") return wrapup(args.includes("--dry-run"), json);
 
@@ -58,7 +62,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   if (sub === "digest") return cmdDigest(flag);
 
   if (!["all", "commits", "sessions", "gh"].includes(sub)) {
-    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, gh, digest, ls, wrapup, tomorrow, idea, new, repo, tui, or all` };
+    return { ok: false, error: `unknown subcommand "${sub}" — use commits, sessions, gh, digest, ls, wrapup, tomorrow, idea, new, repo, tui, app, or all` };
   }
 
   return cmdWindow({ ctx, flag, json, sub, name, week, weekSpec, yearSpec, isDefault });

@@ -12,6 +12,7 @@
 //   maw week [sessions|commits|gh|all]  the same views since local Monday 00:00 — read-only
 //   maw week 39 · maw week 2025W40 · maw week 40 --year 2025   a past ISO week, Monday to Monday
 //   maw week today                 exactly maw today (also: maw today week = maw week)
+//   maw today app · maw week app   the same window as a 3D page on 127.0.0.1 (--port N, --no-open)
 //
 // FLEET RULE, honoured deliberately: this NEVER walks the filesystem looking for
 // repos. `ghq list` is the index and it is instant. No find, no bfs, no grep -r

@@ -24,7 +24,7 @@ export type WindowOpts = {
 
 // Verbs that read a window. The rest (wrapup, tui, new, repo, tomorrow, idea, ls,
 // digest) are about one day or one repo, so `maw week <them>` is refused, not guessed.
-export const WEEK_VERBS = new Set(["sessions", "commits", "gh", "all"]);
+export const WEEK_VERBS = new Set(["sessions", "commits", "gh", "all", "app"]);
 
 export type Commit = { repo: string; hash: string; at: number; subject: string; author: string };
 

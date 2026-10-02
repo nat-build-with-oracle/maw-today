@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>maw today — 3D</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0a0a0f; color: #e8eaf0; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; }
+  #hud { position: fixed; top: 12px; left: 14px; max-width: 750px; pointer-events: none; }
+  #hud h1 { margin: 0 0 4px; font-size: 15px; color: #64b5f6; font-weight: 600; }
+  #hud .sub { color: #b8bcc8; }
+  #legend { position: fixed; bottom: 12px; left: 14px; color: #b8bcc8; }
+  #legend span { display: inline-block; width: 10px; height: 10px; margin: 0 4px 0 12px; vertical-align: -1px; border-radius: 2px; }
+  #legend span:first-child { margin-left: 0; }
+  #tip { position: fixed; pointer-events: none; background: #14141c; border: 1px solid #2a2a38; padding: 6px 8px; border-radius: 4px; display: none; max-width: 420px; white-space: pre-wrap; }
+  #status { position: fixed; top: 12px; right: 14px; color: #b8bcc8; }
+  #status button { background: #14141c; color: #e8eaf0; border: 1px solid #2a2a38; border-radius: 4px; padding: 3px 8px; font: inherit; cursor: pointer; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://esm.sh/three@0.169.0",
+  "three/addons/": "https://esm.sh/three@0.169.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hud"><h1 id="title">maw today</h1><div class="sub" id="summary">gathering…</div></div>
+<div id="status"><span id="when"></span> <button id="reload">refresh</button></div>
+<div id="legend"><span style="background:#ffb74d"></span>typed session <span style="background:#5c6370"></span>background session <span style="background:#64b5f6"></span>commit <span style="background:#81c784"></span>PR / issue</div>
+<div id="tip"></div>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+// The scene's axes: X is time across the window (left = start, right = now), Z is one
+// lane per repo, Y is how much — a commit is a cube stacked in its lane, a session is a
+// pillar whose height grows with the log of its transcript size.
+const W = 120, LANE = 3.2;
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a0f);
+scene.fog = new THREE.Fog(0x0a0a0f, 160, 420);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 2000);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+sun.position.set(60, 120, 80);
+scene.add(sun);
+
+const world = new THREE.Group();
+scene.add(world);
+const pickable = [];
+
+function label(text, color = "#b8bcc8", size = 28) {
+  const c = document.createElement("canvas");
+  const g = c.getContext("2d");
+  g.font = `${size}px ui-monospace, Menlo, monospace`;
+  c.width = Math.ceil(g.measureText(text).width) + 8; c.height = size + 10;
+  g.font = `${size}px ui-monospace, Menlo, monospace`;
+  g.fillStyle = color; g.textBaseline = "top"; g.fillText(text, 4, 4);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthWrite: false }));
+  s.scale.set(c.width / 18, c.height / 18, 1);
+  return s;
+}
+
+// Session projects arrive as decoded paths (/opt/Code/github/com/laris/co/neo/oracle);
+// commits as repo paths. Both reduce to the repo's last name so a repo's sessions and
+// commits share a lane where the decode allows it.
+const sessionLane = (p) => p.split("/").filter(Boolean).slice(-2).join("-");
+const repoLane = (r) => r.split("/").pop();
+const hm = (ms) => new Date(ms).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+
+function build(data) {
+  world.clear(); pickable.length = 0;
+  const now = Date.now();
+  const t0 = data.since, t1 = data.until ?? now;
+  const x = (ms) => ((Math.min(Math.max(ms, t0), t1) - t0) / (t1 - t0)) * W - W / 2;
+  const commits = data.commits ?? [], sessions = data.sessions ?? [], gh = Array.isArray(data.gh) ? data.gh : [];
+
+  // Lanes: busiest nearest the camera, so the front rows are where the day happened.
+  const weight = new Map();
+  for (const c of commits) weight.set(repoLane(c.repo), (weight.get(repoLane(c.repo)) ?? 0) + 1);
+  for (const s of sessions) weight.set(sessionLane(s.project), (weight.get(sessionLane(s.project)) ?? 0) + 3);
+  for (const g of gh) weight.set(repoLane(g.repo), (weight.get(repoLane(g.repo)) ?? 0) + 1);
+  const lanes = [...weight.entries()].sort((a, b) => b[1] - a[1]).map(([k]) => k).slice(0, 60);
+  const z = new Map(lanes.map((k, i) => [k, (lanes.length - 1 - i) * LANE]));
+  const depth = Math.max(lanes.length * LANE, 10);
+
+  // Floor and day/hour lines.
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(W + 20, depth + 10), new THREE.MeshStandardMaterial({ color: 0x101018 }));
+  floor.rotation.x = -Math.PI / 2; floor.position.set(0, -0.01, depth / 2 - LANE / 2);
+  world.add(floor);
+  const lineMat = new THREE.LineBasicMaterial({ color: 0x24243a });
+  const dayMat = new THREE.LineBasicMaterial({ color: 0x3a4a66 });
+  const span = t1 - t0, multiDay = span > 86400e3 * 1.01;
+  const step = multiDay ? 86400e3 : 3600e3;
+  const first = new Date(t0); first.setMinutes(0, 0, 0); if (multiDay) first.setHours(0);
+  for (let t = first.getTime(); t <= t1; t += step) {
+    if (t < t0) continue;
+    const g = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(x(t), 0, -LANE), new THREE.Vector3(x(t), 0, depth + LANE * 0.4)]);
+    world.add(new THREE.Line(g, multiDay ? dayMat : lineMat));
+    const d = new Date(t);
+    const l = label(multiDay ? d.toLocaleString("en", { weekday: "short", day: "numeric", month: "short" }) : `${String(d.getHours()).padStart(2, "0")}:00`, "#8fa8c8", multiDay ? 44 : 30);
+    l.position.set(x(t) + (multiDay ? W / ((span / 86400e3) * 2) : 0), 0.5, depth + LANE * 0.8);
+    world.add(l);
+  }
+  for (const k of lanes) {
+    const l = label(k, "#c8ccd8", 26);
+    l.position.set(-W / 2 - 4 - l.scale.x / 2, 0.6, z.get(k));
+    world.add(l);
+  }
+
+  // Commits: cubes stacked per (lane, time bucket).
+  const stack = new Map();
+  const cube = new THREE.BoxGeometry(0.9, 0.9, 0.9);
+  const commitMat = new THREE.MeshStandardMaterial({ color: 0x64b5f6, emissive: 0x0d2a44 });
+  for (const c of commits) {
+    const lane = repoLane(c.repo); if (!z.has(lane)) continue;
+    const bx = Math.round(x(c.at));
+    const key = `${lane}|${bx}`; const h = stack.get(key) ?? 0; stack.set(key, h + 1);
+    const m = new THREE.Mesh(cube, commitMat);
+    m.position.set(bx, 0.45 + h * 0.95, z.get(lane) + 0.7);
+    m.userData.tip = `commit ${c.hash}  ${hm(c.at)}\n${c.repo.split("/").slice(-2).join("/")}\n${c.subject}`;
+    world.add(m); pickable.push(m);
+  }
+
+  // Sessions: pillars at last typing (typed) or last write (background).
+  const typedMat = new THREE.MeshStandardMaterial({ color: 0xffb74d, emissive: 0x3a2400 });
+  const bgMat = new THREE.MeshStandardMaterial({ color: 0x5c6370 });
+  for (const s of sessions) {
+    const lane = sessionLane(s.project); if (!z.has(lane)) continue;
+    const typed = (s.typedAt ?? 0) >= t0;
+    const h = Math.max(0.6, Math.log10(Math.max(s.bytes, 1000)) * 2 - 5);
+    const p = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.45, h, 12), typed ? typedMat : bgMat);
+    p.position.set(x(typed ? s.typedAt : s.at), h / 2, z.get(lane) - 0.7);
+    const mb = (s.bytes / 1048576).toFixed(1);
+    p.userData.tip = `session ${s.id}  ${typed ? "typed " + hm(s.typedAt) : "background"}\nlast write ${hm(s.at)} · ${mb} MB\n${s.project}`;
+    world.add(p); pickable.push(p);
+  }
+
+  // GitHub: flat green tiles on the floor.
+  const tileMat = new THREE.MeshStandardMaterial({ color: 0x81c784, emissive: 0x0f2a10 });
+  const tile = new THREE.BoxGeometry(0.8, 0.15, 0.8);
+  for (const g of gh) {
+    const lane = repoLane(g.repo); if (!z.has(lane) || !g.at) continue;
+    const m = new THREE.Mesh(tile, tileMat);
+    m.position.set(x(g.at), 0.08, z.get(lane));
+    m.userData.tip = `${g.kind} ${g.repo}#${g.number}  ${hm(g.at)}\n${g.title}\n${g.author}`;
+    world.add(m); pickable.push(m);
+  }
+
+  // Framed from the front-left, high enough that the far lanes clear the near ones and
+  // the day labels along the front edge stay in view.
+  camera.position.set(-W * 0.25, Math.max(70, depth * 0.95), depth + W * 0.55);
+  controls.target.set(W * 0.05, 0, depth * 0.5);
+  controls.update();
+
+  const typed = sessions.filter((s) => (s.typedAt ?? 0) >= t0).length;
+  document.getElementById("title").textContent = `maw ${data.label?.startsWith("week") ? "week" : "today"} — ${data.label}`;
+  document.getElementById("summary").textContent =
+    `${sessions.length} sessions (${typed} typed) · ${commits.length} commits · ${gh.length} PR/issue events · ${lanes.length} repos` +
+    (data.ghError ? " · github unreachable" : "") + (weight.size > lanes.length ? ` (busiest ${lanes.length} shown)` : "");
+  document.getElementById("when").textContent = `as of ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })}`;
+}
+
+async function load() {
+  document.getElementById("summary").textContent = "gathering… (the commit scan takes a few seconds)";
+  try {
+    const r = await fetch("/api/data");
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error ?? r.statusText);
+    build(data);
+  } catch (e) {
+    document.getElementById("summary").textContent = `could not load: ${e.message} — is maw today app still running?`;
+  }
+}
+document.getElementById("reload").onclick = load;
+
+const ray = new THREE.Raycaster(), mouse = new THREE.Vector2(), tip = document.getElementById("tip");
+addEventListener("pointermove", (e) => {
+  mouse.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  ray.setFromCamera(mouse, camera);
+  const hit = ray.intersectObjects(pickable)[0];
+  if (hit) { tip.style.display = "block"; tip.textContent = hit.object.userData.tip; tip.style.left = `${e.clientX + 14}px`; tip.style.top = `${e.clientY + 14}px`; }
+  else tip.style.display = "none";
+});
+addEventListener("resize", () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+load();
+</script>
+</body>
+</html>
