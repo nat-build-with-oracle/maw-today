@@ -12,6 +12,7 @@ import { buildWrapupBundle } from "./wrapup-bundle";
 //   maw today idea <title>         birth an idea capsule — PRIVATE repo idea-7sep-mon2026-<slug>, linked from today
 //   maw today ls                   every jsonl touched today — Claude + Codex, read-only, full liveness detection
 //   maw week [sessions|commits|gh|all]  the same views since local Monday 00:00 — read-only
+//   maw week 39 · maw week 2025W40 · maw week 40 --year 2025   a past ISO week, Monday to Monday
 //   maw week today                 exactly maw today (also: maw today week = maw week)
 //
 // ┌──────────────────────────────────────────────────────────────────────────┐
@@ -115,6 +116,35 @@ export function isoWeek(d = new Date()): string {
   return `${t.getFullYear()}W${String(wk).padStart(2, "0")}`;
 }
 
+/** Local Monday 00:00 of ISO week `w` of ISO year `y` (week 1 holds 4 January). */
+export function isoWeekStart(y: number, w: number): Date {
+  const jan4 = new Date(y, 0, 4);
+  return new Date(y, 0, 4 - ((jan4.getDay() + 6) % 7) + (w - 1) * 7);
+}
+
+/** Which week `maw week` shows: none = this week; `39` = week 39 of this ISO year (or of
+ *  --year); `2025W40` / `2025-W40` names both. Throws with the fix on a week that does
+ *  not exist, never silently shows another. */
+export function parseWeekSpec(spec?: string, year?: string, now = new Date()): { start: Date; end: Date; tag: string } {
+  const cur = isoWeek(now);
+  let y = Number(cur.slice(0, 4)), w = Number(cur.slice(5));
+  if (year !== undefined) {
+    if (!/^\d{4}$/.test(year)) throw new Error(`--year needs four digits, got "${year}"\n  maw week ${w} --year ${y}`);
+    y = Number(year);
+  }
+  if (spec !== undefined) {
+    const m = /^(?:(\d{4})-?[wW])?(\d{1,2})$/.exec(spec);
+    if (!m) throw new Error(`cannot read week "${spec}" — use a number or YYYYWnn\n  maw week ${w}\n  maw week ${y}W${String(w).padStart(2, "0")}`);
+    if (m[1]) y = Number(m[1]);
+    w = Number(m[2]);
+  }
+  const last = Number(isoWeek(new Date(y, 11, 28)).slice(5));   // 28 Dec is always in the year's last week
+  if (w < 1 || w > last) throw new Error(`${y} has weeks 1–${last}; there is no week ${w}\n  maw week ${last} --year ${y}`);
+  const start = isoWeekStart(y, w);
+  const end = new Date(start); end.setDate(end.getDate() + 7);
+  return { start, end, tag: `${y}W${String(w).padStart(2, "0")}` };
+}
+
 /** Split off the week mode. `maw week` is this plugin under its alias (Nat, 2026-10-02):
  *  the host names the typed verb in ctx.matchedName (MAW_MATCHED_NAME for a host that
  *  only sets the env). `maw today week` reaches the same view on a host that passes
@@ -178,12 +208,13 @@ async function candidates(repos: string[], since: number): Promise<string[]> {
   return hits;
 }
 
-async function commitsIn(repo: string, since: number, strict = false): Promise<Commit[]> {
+async function commitsIn(repo: string, since: number, strict = false, until?: number): Promise<Commit[]> {
   try {
     // %x1f is a unit separator: subjects contain every other delimiter you might pick.
     const { stdout } = await run(
       "git",
       ["-C", repo, "log", "--all", "--no-merges", `--since=${new Date(since).toISOString()}`,
+       ...(until ? [`--until=${new Date(until).toISOString()}`] : []),
        "--pretty=format:%H%x1f%ct%x1f%an%x1f%s"],
       { maxBuffer: 8 << 20 },
     );
@@ -206,6 +237,7 @@ export async function gitToday(
   onRepo?: (repo: string, commits: Commit[]) => void | Promise<void>,
   onScan?: (repoCount: number, candidateCount: number) => void | Promise<void>,
   strict = false,
+  until?: number,
 ): Promise<Commit[]> {
   const repos = await ghqRepos();
   const cand = await candidates(repos, since);
@@ -214,7 +246,7 @@ export async function gitToday(
   const CHUNK = 16; // process spawns, not stats — keep this small
   for (let i = 0; i < cand.length; i += CHUNK) {
     const slice = cand.slice(i, i + CHUNK);
-    const batch = await Promise.all(slice.map((r) => commitsIn(r, since, strict)));
+    const batch = await Promise.all(slice.map((r) => commitsIn(r, since, strict, until)));
     for (let j = 0; j < batch.length; j++) {
       await onRepo?.(slice[j], batch[j]);   // fires on zero commits too — a check is an event
       out.push(...batch[j]);
@@ -234,7 +266,9 @@ export type Session = { project: string; id: string; at: number; bytes: number; 
  * The encoded name is the project path with / and . replaced by -, so it decodes
  * back to something readable enough to group by.
  */
-export async function sessionsToday(since: number): Promise<Session[]> {
+// With `until` (a past week), a session last written AFTER the window is not listed even
+// if it ran inside it — mtime is the only clock a directory scan has.
+export async function sessionsToday(since: number, until = Infinity): Promise<Session[]> {
   const root = join(homedir(), ".claude", "projects");
   const out: Session[] = [];
   let dirs: string[] = [];
@@ -253,7 +287,7 @@ export async function sessionsToday(since: number): Promise<Session[]> {
     for (const f of files) {
       try {
         const s = await stat(join(root, d, f));
-        if (s.mtimeMs >= since) {
+        if (s.mtimeMs >= since && s.mtimeMs < until) {
           out.push({ project: d.replace(/^-/, "/").replace(/-/g, "/"), id: f.slice(0, 8), at: s.mtimeMs, bytes: s.size, file: join(root, d, f) });
         }
       } catch { /* vanished mid-scan; not fatal */ }
@@ -331,8 +365,10 @@ const ghOwners = () => {
  */
 export type GhDay = { items: GhItem[]; truncated: boolean };
 
-export async function ghToday(since: number): Promise<GhDay> {
-  const iso = `>=${new Date(since).toISOString()}`;
+export async function ghToday(since: number, until?: number): Promise<GhDay> {
+  const iso = until
+    ? `${new Date(since).toISOString()}..${new Date(until - 1000).toISOString()}`
+    : `>=${new Date(since).toISOString()}`;
   const owners = ghOwners().flatMap((o) => ["--owner", o]);
   // 1000 is gh's hard max. rows.length === LIMIT means MORE existed — the motivating
   // sprint day (198/173/125) fit inside the old 100 cap in NO category, and a saturated
@@ -943,6 +979,15 @@ async function wrapup(dryRun: boolean, json: boolean): Promise<InvokeResult> {
 export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   const { week, args } = splitWeek(asArgs(ctx.args), ctx.matchedName ?? process.env.MAW_MATCHED_NAME);
   const name = week ? "week" : "today";
+  // Pull the week selector out before the verb is looked for: `maw week 39 commits`
+  // would otherwise read "39" as the verb, and `--year 2025` would make 2025 one.
+  let weekSpec: string | undefined, yearSpec: string | undefined;
+  if (week) {
+    const yi = args.indexOf("--year");
+    if (yi >= 0) { yearSpec = args[yi + 1] ?? ""; args.splice(yi, 2); }
+    const si = args.findIndex((a) => /^(\d{4}-?[wW])?\d{1,2}$/.test(a));
+    if (si >= 0) { weekSpec = args[si]; args.splice(si, 1); }
+  }
   const flag = (n: string) => {
     const i = args.indexOf(`--${n}`);
     return i >= 0 ? args[i + 1] : undefined;
@@ -959,7 +1004,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   // `maw week` never writes: there is no week repo, and the day repo is today's.
   const isDefault = verb === undefined && !json && !week;
   if (week && !WEEK_VERBS.has(sub))
-    return { ok: false, error: `maw week reads a window; "${sub}" is a day verb.\n  maw today ${args.join(" ")}\n  maw week all` };
+    return { ok: false, error: `maw week reads a window; "${sub}" is not a week view (sessions, commits, gh, all).\n  maw today ${args.join(" ")}\n  maw week all` };
 
   // The TUI owns the terminal, so it cannot draw through this {ok, output} contract —
   // it runs as its own process, the same shape as atlas's bf-tui. But "inherit" is NOT
@@ -1136,10 +1181,16 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   }
 
   let since: { at: number; label: string };
+  let until: number | undefined;   // set only for a past week; this week runs to now
+  let span = daySlug();
   try {
-    since = week && !flag("since")
-      ? { at: weekStart().getTime(), label: `week ${isoWeek()}` }
-      : resolveSince(flag("since"));
+    if (week && !flag("since")) {
+      const wk = parseWeekSpec(weekSpec, yearSpec);
+      since = { at: wk.start.getTime(), label: `week ${wk.tag}` };
+      if (wk.end.getTime() <= Date.now()) until = wk.end.getTime();
+      const last = new Date(Math.min(wk.end.getTime() - 1, Date.now()));
+      span = `${wk.tag} · ${daySlug(wk.start)} → ${daySlug(last)}${wk.start.getFullYear() !== new Date().getFullYear() ? ` ${wk.start.getFullYear()}` : ""}`;
+    } else since = resolveSince(flag("since"));
   } catch (e) {
     return { ok: false, error: String((e as Error).message) };
   }
@@ -1152,14 +1203,14 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   // than a consumer waiting four seconds. gh failure surfaces as ghError, never as [].
   if (json) {
     const [commits, sessions, gh] = await Promise.all([
-      wantCommits ? gitToday(since.at) : Promise.resolve(null),
-      wantSessions ? sessionsToday(since.at) : Promise.resolve(null),
-      wantGh ? ghToday(since.at).catch((e) => ({ ghError: String((e as Error).message) })) : Promise.resolve(null),
+      wantCommits ? gitToday(since.at, undefined, undefined, false, until) : Promise.resolve(null),
+      wantSessions ? sessionsToday(since.at, until) : Promise.resolve(null),
+      wantGh ? ghToday(since.at, until).catch((e) => ({ ghError: String((e as Error).message) })) : Promise.resolve(null),
     ]);
     // gh mirrors commits/sessions symmetry: null when not requested AND on failure —
     // a consumer's `payload.gh ?? []` must never manufacture a false zero silently,
     // so failure carries ghError alongside the null.
-    const payload: Record<string, unknown> = { since: since.at, label: since.label, commits, sessions, gh: null };
+    const payload: Record<string, unknown> = { since: since.at, ...(until ? { until } : {}), label: since.label, commits, sessions, gh: null };
     if (wantGh && gh) {
       if ("items" in gh) { payload.gh = gh.items; payload.ghTruncated = gh.truncated; }
       else payload.ghError = (gh as { ghError: string }).ghError;
@@ -1175,12 +1226,11 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   const buf: string[] = [];
   const emit = async (line = "") => { if (ctx.writer) await ctx.writer(line); else buf.push(line); };
 
-  const range = week && since.label.startsWith("week ") ? `${since.label.slice(5)} · ${daySlug(weekStart())} → ${daySlug()}` : daySlug();
-  await emit(`maw ${name} — ${range}${since.label === "today" || since.label.startsWith("week ") ? "" : ` · ${since.label}`} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })} ${tzTag()}`);
+  await emit(`maw ${name} — ${span}${since.label === "today" || since.label.startsWith("week ") ? "" : ` · ${since.label}`} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })} ${tzTag()}`);
 
   let sessions: Session[] | null = null;
   if (wantSessions) {
-    sessions = await sessionsToday(since.at);
+    sessions = await sessionsToday(since.at, until);
     await emit();
     if (!sessions.length) await emit("sessions  none");
     else {
@@ -1231,6 +1281,8 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
           await emit(`    ${hhmm(c.at)}  ${c.hash}  ${c.subject.slice(0, 78)}`);
       },
       (repoCount, candCount) => emit(`commits — checking ${candCount} of ${repoCount} repos with fresh .git…`),
+      false,
+      until,
     );
     const repos = new Set(commits.map((c) => c.repo)).size;
     await emit();
@@ -1243,7 +1295,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   if (wantGh) {
     await emit();
     try {
-      const gh = await ghToday(since.at);
+      const gh = await ghToday(since.at, until);
       const n = ghCounts(gh.items);
       await emit(`github    ${n.opened} PR${n.opened === 1 ? "" : "s"} opened · ${n.merged} merged · ${n.closed} issue${n.closed === 1 ? "" : "s"} closed` +
         (gh.truncated ? " — TRUNCATED at 1000/category, counts are floors" : ""));

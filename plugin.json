@@ -11,7 +11,7 @@
       "td",
       "week"
     ],
-    "help": "maw today — sessions at a glance · commits (nested repo listing) · gh · all · ls · tui · tomorrow · idea <title> · wrapup [--dry-run] · --since 3d · --json  ·  maw week [sessions|commits|gh|all] — the same since Monday, read-only · maw week today = maw today"
+    "help": "maw today — sessions at a glance · commits (nested repo listing) · gh · all · ls · tui · tomorrow · idea <title> · wrapup [--dry-run] · --since 3d · --json  ·  maw week [N|YYYYWnn] [--year YYYY] [sessions|commits|gh|all] — the same for an ISO week, read-only · maw week today = maw today"
   },
   "capabilities": [
     "fs:read"
