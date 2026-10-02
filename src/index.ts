@@ -11,6 +11,8 @@ import { buildWrapupBundle } from "./wrapup-bundle";
 //   maw today tomorrow             pre-birth tomorrow's day repo
 //   maw today idea <title>         birth an idea capsule — PRIVATE repo idea-7sep-mon2026-<slug>, linked from today
 //   maw today ls                   every jsonl touched today — Claude + Codex, read-only, full liveness detection
+//   maw week [sessions|commits|gh|all]  the same views since local Monday 00:00 — read-only
+//   maw week today                 exactly maw today (also: maw today week = maw week)
 //
 // ┌──────────────────────────────────────────────────────────────────────────┐
 // │  WHY THE PREFILTER EXISTS — this is the whole design.                    │
@@ -50,6 +52,8 @@ type InvokeContext = {
   args?: unknown;
   writer?: (...v: unknown[]) => unknown | PromiseLike<unknown>;
   signal?: AbortSignal;
+  /** The name the user typed — "today", "td" or "week". maw-cli's js host sets it. */
+  matchedName?: string;
 };
 type InvokeResult = { ok: boolean; output?: string; error?: string };
 
@@ -91,6 +95,40 @@ export function resolveSince(spec?: string): { at: number; label: string } {
   // window the caller did not ask for and looks identical to success.
   throw new Error(`cannot parse --since "${spec}" — use 1d, 3h, or YYYY-MM-DD`);
 }
+
+/** Local Monday 00:00 of the week holding `d` — "this week" is a calendar word, as
+ *  "today" is: on Friday nobody means "the last seven days from Friday noon". */
+export function weekStart(d = new Date()): Date {
+  const m = new Date(d);
+  m.setHours(0, 0, 0, 0);
+  m.setDate(m.getDate() - ((m.getDay() + 6) % 7));
+  return m;
+}
+
+/** "2026W40" — ISO week-numbering year and week (the week holding Thursday decides),
+ *  the same tag relic v3 names its week partitions with. */
+export function isoWeek(d = new Date()): string {
+  const t = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  t.setDate(t.getDate() + 3 - ((t.getDay() + 6) % 7));
+  const jan4 = new Date(t.getFullYear(), 0, 4);
+  const wk = 1 + Math.round(((t.getTime() - jan4.getTime()) / 86400e3 - 3 + ((jan4.getDay() + 6) % 7)) / 7);
+  return `${t.getFullYear()}W${String(wk).padStart(2, "0")}`;
+}
+
+/** Split off the week mode. `maw week` is this plugin under its alias (Nat, 2026-10-02):
+ *  the host names the typed verb in ctx.matchedName (MAW_MATCHED_NAME for a host that
+ *  only sets the env). `maw today week` reaches the same view on a host that passes
+ *  neither, and `maw week today` is plain `maw today` — writes and all. */
+export function splitWeek(args: string[], typedName?: string): { week: boolean; args: string[] } {
+  let week = typedName === "week";
+  if (args[0] === "week") { week = true; args = args.slice(1); }
+  if (week && args[0] === "today") return { week: false, args: args.slice(1) };
+  return { week, args };
+}
+
+// Verbs that read a window. The rest (wrapup, tui, new, repo, tomorrow, idea, ls,
+// digest) are about one day or one repo, so `maw week <them>` is refused, not guessed.
+const WEEK_VERBS = new Set(["sessions", "commits", "gh", "all"]);
 
 // ---- commits ----------------------------------------------------------------
 
@@ -499,8 +537,14 @@ export function writeDigest(commits: Commit[], sessions: Session[], label: strin
 
 // ---- render -----------------------------------------------------------------
 
-const hhmm = (ms: number) =>
-  new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+// A time before local midnight carries its weekday ("Tue 14:05"): over a week, or
+// --since 3d, a bare 14:05 does not say which day it was.
+const hhmm = (ms: number) => {
+  const d = new Date(ms);
+  const t = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+  return ms < midnight.getTime() ? `${d.toLocaleString("en", { weekday: "short" })} ${t}` : t;
+};
 
 const short = (p: string) => p.split("/").slice(-2).join("/");
 
@@ -897,7 +941,8 @@ async function wrapup(dryRun: boolean, json: boolean): Promise<InvokeResult> {
 }
 
 export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
-  const args = asArgs(ctx.args);
+  const { week, args } = splitWeek(asArgs(ctx.args), ctx.matchedName ?? process.env.MAW_MATCHED_NAME);
+  const name = week ? "week" : "today";
   const flag = (n: string) => {
     const i = args.indexOf(`--${n}`);
     return i >= 0 ? args[i + 1] : undefined;
@@ -911,7 +956,10 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   // Bare `maw today` (no verb) shows the sessions glance, THEN auto-syncs the day repo
   // (Nat, 2026-09-01: "the output of maw today should show this first … then auto append").
   // An explicit `maw today sessions|commits|all` must NOT write — a read verb stays a read.
-  const isDefault = verb === undefined && !json;
+  // `maw week` never writes: there is no week repo, and the day repo is today's.
+  const isDefault = verb === undefined && !json && !week;
+  if (week && !WEEK_VERBS.has(sub))
+    return { ok: false, error: `maw week reads a window; "${sub}" is a day verb.\n  maw today ${args.join(" ")}\n  maw week all` };
 
   // The TUI owns the terminal, so it cannot draw through this {ok, output} contract —
   // it runs as its own process, the same shape as atlas's bf-tui. But "inherit" is NOT
@@ -1089,7 +1137,9 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
 
   let since: { at: number; label: string };
   try {
-    since = resolveSince(flag("since"));
+    since = week && !flag("since")
+      ? { at: weekStart().getTime(), label: `week ${isoWeek()}` }
+      : resolveSince(flag("since"));
   } catch (e) {
     return { ok: false, error: String((e as Error).message) };
   }
@@ -1125,7 +1175,8 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
   const buf: string[] = [];
   const emit = async (line = "") => { if (ctx.writer) await ctx.writer(line); else buf.push(line); };
 
-  await emit(`maw today — ${daySlug()}${since.label === "today" ? "" : ` · ${since.label}`} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })} ${tzTag()}`);
+  const range = week && since.label.startsWith("week ") ? `${since.label.slice(5)} · ${daySlug(weekStart())} → ${daySlug()}` : daySlug();
+  await emit(`maw ${name} — ${range}${since.label === "today" || since.label.startsWith("week ") ? "" : ` · ${since.label}`} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })} ${tzTag()}`);
 
   let sessions: Session[] | null = null;
   if (wantSessions) {
@@ -1146,7 +1197,7 @@ export async function handler(ctx: InvokeContext): Promise<InvokeResult> {
         for (const s of bg) await emit(`    ${hhmm(s.at)}  ${s.id}  ${short(s.project).padEnd(26)} ${bytes(s.bytes)}`);
       }
     }
-    if (!wantCommits) await emit(`\ncommits: maw today commits · both: maw today all · live: maw today tui`);
+    if (!wantCommits) await emit(`\ncommits: maw ${name} commits · all: maw ${name} all${week ? " · today: maw week today" : " · live: maw today tui · week: maw week"}`);
   }
 
   // Bare `maw today`: after the glance is flushed, auto-sync the day repo and append its
