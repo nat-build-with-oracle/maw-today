@@ -53,3 +53,32 @@ test("Codex child uses first metadata identity and excludes inherited pre-birth 
     expect(nodes.find(n => n.path === child)).toMatchObject({ fullId: "child-id", parent, role: "subagent", humanMsgs: 0, start: "2026-09-05 17:00:00 +07:00" });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("title: Claude ai-title captured verbatim; Codex has no equivalent and stays null", async () => {
+  const root = mkdtempSync(join(tmpdir(), "chain-title-"));
+  const claude = join(root, "claude"), codex = join(root, "codex");
+  const titled = join(claude, "titled", "abcd1234-lead.jsonl");
+  const day = join(codex, "2026", "09", "05"); mkdirSync(day, { recursive: true });
+  const untitled = join(day, "rollout-untitled.jsonl");
+  const save = (p: string, events: unknown[]) => {
+    mkdirSync(p.slice(0, p.lastIndexOf("/")), { recursive: true });
+    writeFileSync(p, events.map(e => JSON.stringify(e)).join("\n") + "\n");
+  };
+  try {
+    save(titled, [
+      { timestamp: "2026-09-05T10:00:00Z", type: "user", cwd: "/x" },
+      { type: "ai-title", aiTitle: "SMTP service registration", sessionId: "abcd1234" },
+    ]);
+    save(untitled, [
+      { type: "session_meta", timestamp: "2026-09-05T09:00:00Z", payload: { id: "untitled-id" } },
+      { timestamp: "2026-09-05T09:00:01Z", type: "response_item",
+        payload: { type: "message", role: "user", content: [{ type: "input_text",
+          text: "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nboilerplate\n</INSTRUCTIONS>\nfix the login bug" }] } },
+    ]);
+    const nodes = await sessionInventory(claude, codex, Date.parse("2026-09-05T00:00:00Z"), Date.parse("2026-09-06T00:00:00Z"), {});
+    expect(nodes.find(n => n.path === titled)).toMatchObject({ title: "SMTP service registration" });
+    expect(nodes.find(n => n.path === untitled)).toMatchObject({ title: null });
+    expect(renderSessions(nodes)).toContain("SMTP service registration");
+    expect(renderSessions(nodes)).not.toContain("AGENTS.md");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
