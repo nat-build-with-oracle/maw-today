@@ -86,14 +86,16 @@ export async function cmdWindow(o: WindowOpts): Promise<InvokeResult> {
       const bgRow = (s: Session, day?: number) =>
         `    ${day === undefined ? hhmm(s.at) : clockOn(s.at, day)}  ${s.id}  ${short(s.project).padEnd(26)} ${bytes(s.bytes)}`;
       if (!days) for (const s of typed) await emit(typedRow(s));
-      else for (const d of groupByDay(typed, (s) => s.at)) {
+      else for (const [i, d] of groupByDay(typed, (s) => s.at).entries()) {
+        if (i) await emit();   // a blank line closes each day before the next header
         await emit(`  ── ${d.label} · ${d.rows.length} ──`);
         for (const s of d.rows) await emit(typedRow(s, d.start));
       }
       if (bg.length) {
         await emit(`  background — file moved, no typed input this window (listeners, agents, heartbeats):`);
         if (!days) for (const s of bg) await emit(bgRow(s));
-        else for (const d of groupByDay(bg, (s) => s.at)) {
+        else for (const [i, d] of groupByDay(bg, (s) => s.at).entries()) {
+          if (i) await emit();
           await emit(`    ── ${d.label} · ${d.rows.length} ──`);
           for (const s of d.rows) await emit(bgRow(s, d.start));
         }
